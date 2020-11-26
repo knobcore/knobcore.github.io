@@ -317,7 +317,7 @@
 
 			const input = document.createElement('input');
 			input.style.appearance = 'textfield';
-			input.style.backgroundColor = 'rgba(0, 0, 0, 0.8)';
+			input.style.backgroundColor = 'rgba(0, 0, 0, 0.4)';
 			input.style.border = 'none';
 			input.style.color = '#ff8800';
 			input.style.fontFamily = 'sans-serif';
