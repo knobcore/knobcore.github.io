@@ -57,11 +57,11 @@
 			function demoBarGraph() {
 				const body = document.getElementsByTagName('body')[0];
 				const graph = pureknob.createBarGraph(150, 40);
-				graph.setProperty('colorFG', '#44ff44');
-				graph.setProperty('colorMarkers', '#ffffff');
+				graph.setProperty('colorFG', '#00ff00');
+				graph.setProperty('colorMarkers', '#ff00ff');
 				graph.setProperty('markerStart', 0);
 				graph.setProperty('markerEnd', 1);
-				graph.setProperty('markerStep', 10);
+				graph.setProperty('markerStep', .10);
 				graph.setProperty('valMin', 0);
 				graph.setProperty('valMax', 1);
 				graph.setValue(.5);
@@ -79,14 +79,14 @@
 					/*
 					 * As long as value is greater than -80, decrement it.
 					 */
-					if (v > -80) {
+					if (v > 0) {
 						v--;
 						graph.setValue(v);
 					}
 
 				};
 
-				window.setInterval(t, 200);
+				window.setInterval(t, 2);
 			}
 
 			/*
