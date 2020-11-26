@@ -17,15 +17,15 @@
 				const knob = pureknob.createKnob(150, 150);
 
 				// Set properties.
-				knob.setProperty('angleStart', -0.75 * Math.PI);
-				knob.setProperty('angleEnd', 0.75 * Math.PI);
+				knob.setProperty('angleStart', -0.5 * Math.PI);
+				knob.setProperty('angleEnd', 0.5 * Math.PI);
 				knob.setProperty('colorFG', '#11ff11');
 				knob.setProperty('trackWidth', 0.1);
 				knob.setProperty('valMin', 0);
 				knob.setProperty('valMax', 22050);
 
 				// Set initial value.
-				knob.setValue(50);
+				knob.setValue(11025);
 
 				/*
 				 * Event listener.
@@ -64,7 +64,7 @@
 				graph.setProperty('markerStep', 2205);
 				graph.setProperty('valMin', 0);
 				graph.setProperty('valMax', 22050);
-				graph.setValue(1);
+				graph.setValue(11050);
 				graph.setPeaks([10]);
 				const node = graph.node();
 				body.appendChild(node);
