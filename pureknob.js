@@ -491,8 +491,8 @@
 					const height = this._height;
 					const width = this._width;
 					const smaller = width < height ? width : height;
-					const centerX = 0.5 * width;
-					const centerY = 0.5 * height;
+					const centerX = 0.4 * width;
+					const centerY = 0.4 * height;
 					const radius = 0.4 * smaller;
 					const labelY = centerY + radius;
 					const lineWidth = Math.round(trackWidth * radius);
