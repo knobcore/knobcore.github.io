@@ -364,15 +364,6 @@
 
 
   <textarea class="code" id="instruments" hidden>
-<CsoundSynthesizer>
-<CsOptions>
-
--n -d -+rtmidi=NULL -M0 -m0d --midi-key-cps=4 --midi-velocity-amp=5 --port=10000
-
-
-</CsOptions>
-; ==============================================
-<CsInstruments>
 
 sr	=	44100
 ksmps	=	2
@@ -1104,15 +1095,11 @@ endin
 
 
 
-</CsInstruments>
-; ==============================================
-<CsScore>
+	  <textarea class="code" id="score" hidden>
+
 i "track1" 0 20
 i "mixer" 0 z  
 i "clock" 0 1 0
-</CsScore>
-
-</CsoundSynthesizer>
 
 
 </textarea>
