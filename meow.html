@@ -1,107 +1,1121 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
-<!DOCTYPE html PUBLIC "-//w3c//dtd xhtml 1.0 strict//en" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml">
-	<head>
-		<title>
-			Knobz
-		</title>
-		<script src="pureknob.js" type="text/javascript"></script>
-		<script type="text/javascript">
-			// <![CDATA[
+<!DOCTYPE html>
+<html>
 
-			/*
-			 * Demo code for knob element.
-			 */
-			function demoKnob() {
-				// Create knob element, 300 x 300 px in size.
-				const knob = pureknob.createKnob(150, 150);
 
-				// Set properties.
-				knob.setProperty('angleStart', -0.5 * Math.PI);
-				knob.setProperty('angleEnd', 0.5 * Math.PI);
-				knob.setProperty('colorFG', '#11ff11');
-				knob.setProperty('trackWidth', 0.1);
-				knob.setProperty('valMin', 0);
-				knob.setProperty('valMax', 22050);
+<head>
+  <title>Knobcore</title>
+  <style type="text/css">
+  
+  .rangeslider{ 
+    width: 100%; 
+} 
+  
+.tab {
+  overflow: hidden;
+  border: 1px solid #ccc;
+  background-color: #00101;
+}
 
-				// Set initial value.
-				knob.setValue(11025);
+/* Style the buttons that are used to open the tab content */
+.tab button {
+  background-color: inherit;
+  float: center;
+  border: none;
+  outline: none;
+  cursor: pointer;
+  padding: 14px 16px;
+  transition: 0.3s;
+}
 
-				/*
-				 * Event listener.
-				 *
-				 * Parameter 'knob' is the knob object which was
-				 * actuated. Allows you to associate data with
-				 * it to discern which of your knobs was actuated.
-				 *
-				 * Parameter 'value' is the value which was set
-				 * by the user.
-				 */
-				const listener = function(knob, value) {
-					console.log(value);
-				};
+/* Change background color of buttons on hover */
+.tab button:hover {
+  background-color: #060;
+}
 
-				knob.addListener(listener);
+/* Create an active/current tablink class */
+.tab button.active {
+  background-color: #060;
+}
 
-				// Create element node.
-				const node = knob.node();
+/* Style the tab content */
+.tabcontent {
+  display: none;
+  padding: 6px 12px;
+  border: 1px solid #060;
+  border-top: none;
+}
+	
+	.glow {
+  font-size: 80px;
+  color: #fff;
+  text-align: center;
+  -webkit-animation: glow .25s ease-in-out infinite alternate;
+  -moz-animation: glow .25s ease-in-out infinite alternate;
+  animation: glow .25s ease-in-out infinite alternate;
+}
 
-				// Add it to the DOM.
-				const elem = document.getElementById('some_element');
-				elem.appendChild(node);
-			}
+@-webkit-keyframes glow {
+  from {
+    text-shadow: 0 0 10px #00f, 0 0 20px #00f, 0 0 30px #00f, 0 0 40px #00f, 0 0 50px #00f, 0 0 60px #00f, 0 0 70px #00f;
+  }
+  
+  to {
+    text-shadow: 0 0 20px #0f0, 0 0 30px #0f0, 0 0 40px #0f0, 0 0 50px #0f0, 0 0 60px #0f0, 0 0 70px #0f0, 0 0 80px #0f0;
+  }
+}
 
-			/*
-			 * Demo code for bar graph element.
-			 */
-			function demoBarGraph() {
-				const body = document.getElementsByTagName('body')[0];
-				const graph = pureknob.createBarGraph(150, 40);
-				graph.setProperty('colorFG', '#00ff00');
-				graph.setProperty('colorMarkers', '#0f0');
-				graph.setProperty('markerStart', 19845);
-				graph.setProperty('markerEnd', 19845);
-				graph.setProperty('markerStep', 2205);
-				graph.setProperty('valMin', 0);
-				graph.setProperty('valMax', 22050);
-				graph.setValue(11050);
-				graph.setPeaks([10]);
-				const node = graph.node();
-				body.appendChild(node);
-				window.graph = graph;
+    table,
+    th,
+    td {
+      border: 1px solid black;
+      background-color: #000000;
+      color: #00ff00;
+    }
 
-				/*
-				 * This is executed on each timer tick.
-				 */
-				const t = function(e) {
-					let v = graph.getValue();
+    th,
+    td {
+      border: 0px solid black;
+      padding: 10px 20px;
+	  background-color: #000000;
+      color: #00ff00;
+    }
 
-					/*
-					 * As long as value is greater than -80, decrement it.
-					 */
-					if (v > 0) {
-						v--;
-						graph.setValue(v);
-					}
+    html,
+    body {
+      font-family: Monospace;
+      color: #009400;
+      background-color: #000000;
+    }
 
-				};
+    #controls {
+      background-color: #000000;
 
-				window.setInterval(t, 1);
-			}
+      padding: 10px 10px;
+    }
 
-			/*
-			 * This is executed after the document finished loading.
-			 */
-			function ready() {
-				demoKnob();
-				demoBarGraph();
-			}
+    #console {
+      font-family: Monospace;
+      color: #00b600;
+      background-color: #001300;
+      font-size: 16px;
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px 0px;
+    }
 
-			document.addEventListener('DOMContentLoaded', ready, false);
-			// ]]>
-		</script>
-	</head>
-	<body style="background-color: #444444">
-		<div id="some_element"/>
-	</body>
+
+    H1 {
+
+	 font-family: Terminal;
+      align-items: center;
+      font-size: 36px;
+ border: 3px solid green;
+      justify-content: center;
+    }
+
+
+    #playButton {
+      margin: 0px 47.5%;;
+	 color: #00ff00;
+	 -webkit-animation: glow .25s ease-in-out infinite alternate;
+  -moz-animation: glow .25s ease-in-out infinite alternate;
+  animation: glow .25s ease-in-out infinite alternate;
+
+
+      font-family: Monospace;
+      width: 5%;
+ 
+	  border: 1px #008800;
+      justify-content: center;
+      align-items: center;
+      font-size: 24px;
+      background-color: #001a00;
+    }
+
+    .bpm {
+      font-size: 16px;
+      text-align: center
+    }
+
+    .bpm input[type=range] {
+      height: 32px;
+      -webkit-appearance: none;
+      margin: 10px 0;
+      width: 100%;
+      background: #000000;
+    }
+
+    .bpm input[type=range]:focus {
+      outline: none;
+	   -webkit-animation: glow .25s ease-in-out infinite alternate;
+  -moz-animation: glow .25s ease-in-out infinite alternate;
+  animation: glow .25s ease-in-out infinite alternate;
+
+    }
+
+    .bpm input[type=range]::-webkit-slider-runnable-track {
+      width: 100%;
+      height: 16px;
+      cursor: pointer;
+      animate: 0.2s;
+      box-shadow: 0px 0px 0px #000000;
+      background: #000000;
+      border-radius: 25px;
+	   -webkit-animation: glow .25s ease-in-out infinite alternate;
+  -moz-animation: glow .25s ease-in-out infinite alternate;
+  animation: glow .25s ease-in-out infinite alternate;
+
+      border: 1px solid #050;
+    }
+
+    .bpm input[type=range]::-webkit-slider-thumb {
+      box-shadow: 1px 1px 1px #00FF00;
+      border: 1px solid #00FF00;
+      height: 25px;
+      width: 20px;
+      border-radius: 8px;
+      background: #000000;
+-webkit-animation: glow .25s ease-in-out infinite alternate;
+  -moz-animation: glow .25s ease-in-out infinite alternate;
+  animation: glow .25s ease-in-out infinite alternate;
+
+      cursor: pointer;
+      -webkit-appearance: none;
+      margin-top: -5px;
+    }
+
+    .bpm input[type=range]:focus::-webkit-slider-runnable-track {
+      background: #000000;
+	   -webkit-animation: glow .25s ease-in-out infinite alternate;
+  -moz-animation: glow .25s ease-in-out infinite alternate;
+  animation: glow .25s ease-in-out infinite alternate;
+
+    }
+
+
+
+
+
+  </style>
+
+
+  <script src="CsoundObj.js"></script>
+  <script type="text/javascript">
+    var pitch_colour = ['#040', '#14f', '#070','#f40', '#04f', '#14f', '#070','#f40','#04f', '#14f', '#070','#f40', '#04f', '#14f', '#070','#f40'
+    ];
+
+    var colour_tab = [pitch_colour[1], pitch_colour[0], pitch_colour[2],
+      pitch_colour[0], pitch_colour[1], pitch_colour[0], pitch_colour[2],
+      pitch_colour[0],pitch_colour[1], pitch_colour[0], pitch_colour[2],
+      pitch_colour[0], pitch_colour[1], pitch_colour[0], pitch_colour[2],
+      pitch_colour[3]
+    ];
+
+    var tab = new Float32Array(16);
+    var pc = new Float32Array(16);
+    var prv;
+    var max = 14
+ 
+
+    function setStep() {
+      for (let i = 0; i < 16; i++) {
+        tab[i] = isOn(i + 1);
+      }
+      csound.setTable(2, tab);
+    }
+
+    function setPitch() {
+      for (let i = 0; i < 16; i++) {
+        var value = document.getElementById("freq" + (i + 1)).value;
+        pc[i] = value / 100.;
+        colour_tab[i] = pitch_colour[tab];
+      }
+      csound.setTable(1, pc);
+    }
+	
+   function isOn(n) {
+      var elem = document.getElementById("step" + n);
+      return elem.checked ?  1 : 0;
+    }
+	
+    function setBpm() {
+      var value = document.getElementById("bpm").value;
+      csound.setControlChannel("bpm", value);
+    }
+
+
+    function setfm() {
+      var value = document.getElementById("fm").value;
+      csound.setControlChannel("fm", value);
+    }
+	
+	    function setmax() {
+      var value = document.getElementById("max").value;
+      csound.setControlChannel("max", value);
+    }
+
+
+	    function setdelaya() {
+      var value = document.getElementById("maxtime").value;
+      csound.setControlChannel("maxtime", value);
+    }
+	
+	
+		    function setshit() {
+	   var value = document.getElementById("time").value;
+	  csound.setControlChannel("time", value);
+    }
+			    function setshit1() {
+	   var value = document.getElementById("time1").value;
+	  csound.setControlChannel("time1", value);
+    }
+	
+				    function setshit2() {
+	   var value = document.getElementById("time2").value;
+	  csound.setControlChannel("time2", value);
+    }
+					    function setshit3() {
+	   var value = document.getElementById("time3").value;
+	  csound.setControlChannel("time3", value);
+    }
+	
+    // message printout
+    function display_msg(mess, step, max) {
+      var messField = document.getElementById("console");
+      messField.style.color = colour_tab[step];
+      messField.innerText = mess;
+      var ths = document.getElementById("tab" + (step + 1));
+      var sm1 = step == max ? 15 : step;
+      var prv = document.getElementById("tab" + sm1);
+      if (isOn(step + 1) == 1)
+      
+	  ths.style.backgroundColor = colour_tab[step];
+      prv.style.backgroundColor = 'black';
+    }
+
+
+    function print_msg(message) {
+      csound.requestControlChannel("step", function() {
+        step = Math.round(csound.getControlChannel("step"));
+		max = Math.round(csound.getControlChannel("max"));
+        display_msg(message, step);
+      });
+    }
+
+
+    function main() {
+       CsoundObj.initialize().then(() => {
+        console.log = print_msg;
+        console.warn = print_msg;
+        document.getElementById('playButton').addEventListener('click',
+          click_this);
+        document.getElementById('playButton').disabled = false;
+        CsoundObj.CSOUND_AUDIO_CONTEXT.suspend();
+        csound = new CsoundObj();
+        csound.compileOrc(document.getElementById('instruments').value);
+        csound.start();
+        window.addEventListener("unload", function(e) {
+          if (csound != null)
+            csound.destroy();
+        }, false);
+      });
+
+    }
+
+    var playing = false;
+
+    function click_this() {
+      if (playing == false) {
+        CsoundObj.CSOUND_AUDIO_CONTEXT.resume();
+        document.getElementById('playButton').innerText = "■";
+        playing = true;
+      } else {
+        CsoundObj.CSOUND_AUDIO_CONTEXT.suspend();
+        document.getElementById('playButton').innerText = "►";
+        playing = false;
+      }
+    }
+	
+	function openCity(evt, cityName) {
+  // Declare all variables
+  var i, tabcontent, tablinks;
+
+  // Get all elements with class="tabcontent" and hide them
+  tabcontent = document.getElementsByClassName("tabcontent");
+  for (i = 0; i < tabcontent.length; i++) {
+    tabcontent[i].style.display = "none";
+  }
+
+  // Get all elements with class="tablinks" and remove the class "active"
+  tablinks = document.getElementsByClassName("tablinks");
+  for (i = 0; i < tablinks.length; i++) {
+    tablinks[i].className = tablinks[i].className.replace(" active", "");
+  }
+
+  // Show the current tab, and add an "active" class to the button that opened the tab
+  document.getElementById(cityName).style.display = "block";
+  evt.currentTarget.className += " active";
+}
+  </script>
+</head>
+
+
+
+  <textarea class="code" id="instruments" hidden>
+<CsoundSynthesizer>
+<CsOptions>
+
+-n -d -+rtmidi=NULL -M0 -m0d --midi-key-cps=4 --midi-velocity-amp=5 --port=10000
+
+
+</CsOptions>
+; ==============================================
+<CsInstruments>
+
+sr	=	44100
+ksmps	=	2
+nchnls	=	2
+0dbfs	=	1
+
+
+gisong = 1
+gkverbz init .25
+gibpm = 70
+
+gisample ftgen  32, 0, 8, 2, 0
+gii2o1 ftgen  1, 0, 4096, 10, .05, .01, .01, .04, .1, .41, .31 
+
+gii2o2 ftgen  2, 0, 4096, 10, 0.01, .015, .2, .3, .01, .01, .004 
+gii2o3 ftgen  3, 0, 4096, 10, .001, .145, .151, .12, .1 
+gii4o1 ftgen  4, 0, 4096, 10, .01, .25, .31, .41 
+gii4o2 ftgen  5, 0, 4096, 10, .01, .5, .41 
+
+gkthr[]   fillarray  -91, -92, -74, -74, -74, -74, -74, -74, -74, -74, -74, -74, -74, -74, -74, -74
+gklo[]    fillarray  -11, -19,  -6,  -6,  -6,  -6,  -6,  -6,  -6,  -6,  -6,  -6,  -6,  -6,  -6,  -6
+gkhi[]    fillarray  -13, -16,  -6,  -6,  -6,  -6,  -6,  -6,  -6,  -6,  -6,  -6,  -6,  -6,  -6,  -6 
+gkrat[]   fillarray   40,  10,  10,  10,  10,  10,  10,  10,  10,  10,  10,  10,  10,  10,  10,  10
+gkatt[]   fillarray   0.01, 0.008,  0.08,  0.08,  0.08,  0.08,  0.08,  0.08,  0.08,  0.08,  0.08,  0.08,  0.08,  0.08,  0.08,  0.08
+gkrel[]   fillarray   0.01, 0.008,  0.08,  0.08,  0.08,  0.08,  0.08,  0.08,  0.08,  0.08,  0.08,  0.08,  0.08,  0.08,  0.08,  0.08
+gkmkup[]  fillarray   4,  6,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+instr synth1
+ainit init 0
+
+
+if p4 == 1 then
+
+apitch linseg cpspch(8), .02, cpspch(5)
+aseg linseg 361, .036, 10
+anois rand aseg
+amod oscil aseg, apitch
+amod2 oscil 1, apitch+(amod*2)
+aosc1 oscil .52, (apitch+(amod2*6))+anois
+aenv madsr .001, .2, 0, 0.001
+
+
+
+
+amix1 = aosc1*aenv
+
+
+chnset amix1, "tr1l"
+
+
+aphs phasor 60/gibpm
+tablew amix1, aphs, 32
+
+
+elseif p4 == 2 then
+
+adust dust 1, 500
+adenv linseg 1, .3, 0
+aosc1 atone rand(.6+(adust*.4)), 1000
+aenv linseg 1, .001, 0, 0, 1, .004, 0, 0, 1, .1, 0, 0, .1, .01, .2, 0.14, .01, .5, 0
+amemb oscil 3, 3640+((aosc1*aenv)*443434)
+aenv1 linseg .02, .1, 0
+arev reverb ((aosc1*aenv)+(amemb*aenv1))*aenv1, 1
+aenv2 expseg 1, .0713, 0.001
+afilt linseg 10350, .013, 3220, .18, 100, .1, 6440
+amix2 zdf_2pole tanh(((aosc1*aenv)+(amemb*aenv1)+(arev*.02))*2), afilt, 1.5, 0
+aenv3 adsr .001, .2, 0, .001
+
+amas3 = (((amix2*(aenv3))*aenv2)+(reverb((amix2*(aenv3))*aenv2, .41)*.023))*2
+amas2 dam amas3, .024, .4, .4, 0, 0
+
+
+chnset amas2*.57, "tr1r"
+
+elseif p4 == 3 then
+
+adust dust 1, 30000
+aosc1 atone rand(.41*p5), 16000
+aenv linseg 1, .021, 0
+amix3  zdf_2pole ((aosc1*adust)*aenv), 7500, 5.4, 2
+chnset amix3, "tr2l"
+
+
+endif
+
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr synth2
+giseq ftgen 20, 0, 8, 2, 2, 1, 3, 5, 7, 2, 6, 4 
+inote cps2pch p4, 12 
+;inote = p4
+iamp = p5
+alin3 madsr .001, .5, .015, .5
+alin2 linseg 1.6, .01, 1, 0, 1, .13, .71 
+
+
+alin = (alin3+alin2)*(13+iamp)
+alfo oscil .2, ((60)/gibpm)/2, 20
+alfo1 oscil .5, 61
+alfo2 oscil .14, .5, 2
+amod2 oscil (94*alin2)*(.4+iamp), inote+alfo1, 1
+
+amod1 oscil 27*iamp, (inote+alfo1)+amod2, 2
+afilt  atonex amod1, inote*8
+averbl, averbr reverbsc afilt, afilt, .8, 8000
+aosc1 oscil 1, inote+((amod2)+averbl)*(.14*alin), 3
+aosc2 oscil 1, inote+((amod2)+averbr)*(.14*alin), 3
+afil  atonex tanh(aosc1*.2), inote
+afil1 atonex tanh(aosc2*.2), inote
+
+aenv madsr .001, 2.52, .03, .01
+amix = (afil*aenv)*.34
+amix1 = (afil1*aenv)*.34
+chnmix amix, "tr3l"
+chnmix amix1, "tr3r"
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr synth3
+ipitch cps2pch p4, 12
+alin linseg 2.4, .126, .6	
+alin1 linseg 335, .02, 0
+anoz rand alin1
+aosc1 oscil alin, ipitch
+aoscm pdhalf aosc1, .015
+
+aosc2 oscil .16,  (ipitch+(aoscm*45))+anoz
+aenv madsr .001, .2, 1, .002
+amix = aosc2*aenv
+chnmix amix, "tr2r"
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr synth4
+inote = p4
+aenv1 madsr .01, .26, .1, 2
+alfo oscil .13, (60/gibpm)*4
+alfo1 oscil .3, 5
+alfo2 oscil 1, 1
+aosm oscil .7+alfo, p4, 5
+aosc oscil 1, (p4+(atonex(aosm, inote*(alfo2))*(535*(.3+aenv1))))+alfo1, 4
+aoscm atonex aosc, inote*2
+ 	
+aenv madsr .001, .2, .72, .01
+amix = (aoscm*aenv)*.34
+amix1 = (aoscm*aenv)*.34
+chnmix amix, "tr4l"
+chnmix amix1, "tr4r"
+
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr synth5
+
+
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr symth6	
+
+
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr symth7	
+
+
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr symth8	
+
+
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr synth9	
+
+
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr synth10
+
+
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr symth11	
+
+
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr synth12	
+
+
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr symth13
+
+
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr synth14
+
+
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr synth15
+
+
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr synth16
+
+
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr mixer
+
+if gisong == 1 then
+
+gkfco[] fillarray 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+gklev[] fillarray 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 
+gkq[]   fillarray 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 
+gks[]   fillarray 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 
+
+
+gkfco1[] fillarray 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0   
+gklev1[] fillarray 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+gkq1[]   fillarray 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+gks1[]   fillarray 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+
+
+gkfco2[] fillarray 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0   
+gklev2[] fillarray 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+gkq2[]   fillarray 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+gks2[]   fillarray 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+
+
+
+endif
+
+
+at1 chnget "tr1l"
+at2 chnget "tr1r"
+at3 chnget "tr2l"
+at4 chnget "tr2r"
+at5 chnget "tr3l"
+at6 chnget "tr3r"
+at7 chnget "tr4l"
+at8 chnget "tr4r"
+at9 chnget "tr5l"
+at10 chnget "tr5r"
+at11 chnget "tr6l"
+at12 chnget "tr6r"
+at13 chnget "tr7l"
+at14 chnget "tr7r"
+at15 chnget "tr8l"
+at16 chnget "tr8r"
+at17 chnget "tr9l"
+at18 chnget "tr9r"
+at19 chnget "tr10l"
+at20 chnget "tr10r"
+at21 chnget "tr11l"
+at22 chnget "tr11r"
+at23 chnget "tr12l"
+at24 chnget "tr12r"
+at25 chnget "tr13l"
+at26 chnget "tr13r"
+at27 chnget "tr14l"
+at28 chnget "tr14r"
+at29 chnget "tr15l"
+at30 chnget "tr15r"
+at31 chnget "tr16l"
+at32 chnget "tr16r"
+
+kthr = gkthr[0] 
+klo =  gklo[0]
+khi =  gkhi[0]
+krat = gkrat[0]
+katt = gkatt[0]  
+krel = gkrel[0] 
+kthr1 = gkthr[1] 
+klo1 =  gklo[1]
+khi1 =  gkhi[1]
+krat1 = gkrat[1]
+katt1 = gkatt[1]  
+krel1 = gkrel[1] 
+kmkup1 = gkmkup[0]
+kmkup2 = gkmkup[1]
+ainit init 1
+acomp1l compress2 at1+at2+at3, ainit, kthr, klo, khi,  krat,  katt,  krel, .01 
+acomp1r compress2 at1+at2+at3, ainit, kthr, klo, khi,  krat,  katt,  krel, .01  
+
+areverbl, areverbr reverbsc at5, at6, .87, 6000
+areverb1l, areverb1r reverbsc atonex(at7, 240), atonex(at8, 240), .93, 14600
+ain4ml = at7+(areverb1l*.46)
+ain4mr = at8+(areverb1r*.46)
+ibpms = 60/gibpm
+alfo oscil .001, 2
+adel1 vcomb ain4ml, 15, ((ibpms/2)*1.5)+alfo, ibpms
+adel2 vcomb ain4mr, 15, ((ibpms/2)*2.5)+alfo, ibpms
+amixl = (acomp1l*kmkup1)+((areverbl*gkverbz)+at5)+at4+((ain4ml+(adel1*.25))*.5)
+amixr = (acomp1r*kmkup1)+((areverbr*gkverbz)+at6)+at4+((ain4mr+(adel2*.25))*.5)
+
+acompml compress2 amixl, ainit,  kthr1, klo1, khi1,  krat1,  katt1,  krel1, .01 
+acompmr compress2 amixr, ainit,  kthr1, klo1, khi1,  krat1,  katt1,  krel1, .01 
+
+outs  acompml*kmkup2, acompmr*kmkup2
+chnclear "tr3l"
+chnclear "tr3r"
+chnclear "tr2r"
+chnclear "tr4l"
+chnclear "tr4r"
+endin 
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr track1
+
+
+endin
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr track2
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr track3
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr track4
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr track5
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr track6
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr track7
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr track8
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr track9
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr track10
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr track11
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr track12
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr track13
+
+endin
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr track14
+
+endin
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr track15
+
+endin
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr track16
+
+
+
+endin
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+instr clock
+
+
+imax = 511
+
+
+iwhatever = 0
+ginext = (p5 == imax ? 0 : p5+1)
+inxt = 60/gibpm
+
+ikick[] fillarray \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, \
+0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, \
+0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0
+schedkwhen ikick[ginext], inxt, 0, 1, 0, inxt/ikick[ginext], 1
+
+isnare[] fillarray \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0
+schedkwhen isnare[ginext], inxt, 0, 1, 0, inxt, 2
+
+ihat[] fillarray \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, \
+1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0
+ihatv[] fillarray \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 1, 1, 1, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 1, 1, 1, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 1, 1, 1, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 1, 1, 1, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 1, 1, 1, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 1, 1, 1, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 1, 1, 1, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 0, 0, 0, \
+1, 0, 0, 0, .2, 0, 0, 0, 1, 0, 0, 0, .2, 1, 1, 1
+schedkwhen ihat[ginext], inxt, 0, 1, 0, inxt, 3, ihat[ginext]
+
+ilim wrap ginext,  0, 32
+iblim wrap ginext,  0, 128
+iguit[] fillarray \
+.5*rnd(1), 0, 0, 0, .5*rnd(1), 0, 0, 0, .5*rnd(1), 0, 0, 0, .5*rnd(1), 0, 0, 0, \
+.5*rnd(1), 0, 0, 0, .5*rnd(1), 0, 0, 0, .5*rnd(1), 0, 0, 0, .5*rnd(1), 0, 0, 0
+
+imin[] fillarray 0, .02, .03, .05, .07, .08, .1, 1, 1.02, 1.03, 1.05, 1.07, 1.08, 1.1
+iguitp[] fillarray \
+(7+int(rnd(3)-1))+imin[int(rnd(14))],  0, 0, 0, (7+int(rnd(3)-1))+imin[int(rnd(7))], 0, 0, 0, (7+int(rnd(2)-1))+imin[int(rnd(14))], 0, 0, 0, (7+int(rnd(2)-1))+imin[int(rnd(7))], 0, 0, 0, \
+(7+int(rnd(3)-1))+imin[int(rnd(14))],  0, 0, 0, (7+int(rnd(2)-1))+imin[int(rnd(14))], 0, 0, 0, (7+int(rnd(2)-1))+imin[int(rnd(14))], 0, 0, 0, (7+int(rnd(2)-1))+imin[int(rnd(14))], 0, 0, 0
+
+
+iguitv[] fillarray \
+1,  0, 0, 0,  .15, 0, 0, 0, rnd(1), 0, 0, 0, .15, 0, 0, 0, \
+.25,  0, 0, 0, .75, 0, 0, 0, .15, 0, 0, 0, .75, 0, 0, 0
+
+
+ipitch = iguitp[ilim]
+schedkwhen iguit[ilim], inxt, 0, 2, 0, inxt*iguit[ilim], ipitch, iguitv[ilim]
+
+ibass[] fillarray \
+.5, 0, 0, 0, 0, 0, 0, 0, .5, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+
+
+ibassp[] fillarray \
+5+imin[int(rnd(7))], 5+imin[int(rnd(6))], 5+imin[int(rnd(8))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], \
+5+imin[int(rnd(7))], 5+imin[int(rnd(6))], 5+imin[int(rnd(8))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], \
+5+imin[int(rnd(7))], 5+imin[int(rnd(6))], 5+imin[int(rnd(8))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], \
+5+imin[int(rnd(7))], 5+imin[int(rnd(6))], 5+imin[int(rnd(8))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], \
+5+imin[int(rnd(7))], 5+imin[int(rnd(6))], 5+imin[int(rnd(8))], 5+imin[int(rnd(6))], 5+imin[int(rnd(12))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], \
+5+imin[int(rnd(7))], 5+imin[int(rnd(6))], 5+imin[int(rnd(8))], 5+imin[int(rnd(6))], 5+imin[int(rnd(12))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], \
+5+imin[int(rnd(7))], 5+imin[int(rnd(6))], 5+imin[int(rnd(8))], 5+imin[int(rnd(6))], 5+imin[int(rnd(12))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], \
+5+imin[int(rnd(7))], 5+imin[int(rnd(6))], 5+imin[int(rnd(8))], 5+imin[int(rnd(6))], 5+imin[int(rnd(12))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))], 5+imin[int(rnd(6))]
+
+
+schedkwhen ibass[iblim], inxt, 0, 3, 0, inxt*ibass[iblim], ibassp[iblim]
+
+schedule "clock", inxt/16, inxt/16, inxt/16, ginext
+
+endin
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+
+
+</CsInstruments>
+; ==============================================
+<CsScore>
+i "track1" 0 20
+i "mixer" 0 z  
+i "clock" 0 1 0
+</CsScore>
+
+</CsoundSynthesizer>
+
+
+</textarea>
+</body>
+
 </html>
