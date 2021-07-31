@@ -21,12 +21,12 @@
    #tit {
     font-family: Monospace;
     font-size: 24px;
-    width: 810px;
+    width: 30px;
     display: flex;
     align-items: center;
     justify-content: center;
     border-style: solid;
-    padding: 20px 0px;
+    padding: 0px 0px;
    }
 
    H1 {
@@ -41,7 +41,7 @@
       csound.Play();
       csound.compileOrc(document.getElementById('instruments').value);
 
-      document.getElementById("tit").innerHTML = "Click here to play";
+      document.getElementById("tit").innerHTML = "▶";
     }
 
     function attachListeners() {
@@ -93,7 +93,7 @@ nchnls	=	2
 
 gisong = 1
 gkverbz init .25
-gibpm = 70
+gibpm = 120
 
 gisample ftgen  32, 0, 8, 2, 0
 gii2o1 ftgen  1, 0, 4096, 10, .05, .01, .01, .04, .1, .41, .31 
