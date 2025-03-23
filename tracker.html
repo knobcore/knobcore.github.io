@@ -57,9 +57,9 @@
       border: 1px solid #33ff33;
       background-color: black;
       color: #33ff33;
-      resize: none;  /* remove scrollbar */
+      resize: both;
       white-space: pre;
-      overflow: hidden;
+      overflow: auto;
       text-shadow: none;
     }
     /* Specific Textareas */
@@ -118,20 +118,15 @@
         <button onclick="Play()">Play note</button>
         <button onclick="compile()">Compile</button>
       </div>
-      <div style="padding: 5px; margin: 5px; display: flex; align-items: center;">
-         <!-- Use left/right arrow keys (or buttons) to change visible step page -->
-         <button onclick="prevStepPage()">&larr;</button>
-         <span id="pageDisplay">Steps 0-3</span>
-         <button onclick="nextStepPage()">&rarr;</button>
-      </div>
     </div>
+    <!-- Pattern Counter now shows beat number (1 beat = 16 steps) -->
     <span id="patternCounter">Pattern: 1/1 | Beat: 1 | BPM: 120</span>
     <!-- Editable Pattern Editor.
          Header row: |***| followed by each track’s header (e.g. "######01######"|...|######08######|)
-         Data rows: each row begins with the step counter (e.g. "|000|") then one cell per track formatted as "00,00,00,00,00"
-         The divider characters (|, commas, asterisks) are non-editable.
-         When inserting data into a cell, the new digit overwrites the current value and the caret remains at that cell.
-         Pressing '^' in a cell will change that two-digit group to "^^". -->
+         Then 512 step rows. Each row begins with the step counter (e.g. "|000|") and then one cell per track formatted as "00,00,00,00,00".
+         Special characters (|, commas, asterisks) are non-editable.
+         In each cell, when you insert a value (or '^'), the digit overwrites that location and then the caret stays in that cell.
+         (You can use arrow keys to reposition if needed.) -->
     <textarea class="code" id="patternedit" placeholder="Pattern Editor"></textarea>
     <!-- Read-only Csound Function Table Output -->
     <textarea id="instruments" readonly placeholder="Csound Array Output"></textarea>
@@ -146,9 +141,7 @@
     /***************************************************
      * Global Variables and Cached Elements
      ***************************************************/
-    const stepsPerPattern = 256;
-    const stepsPerPage = 4;  // visible steps per page
-    let stepPage = 0;
+    const stepsPerPattern = 512;  // now 512 steps per pattern
     const channels = ["A", "B", "C", "D", "E"]; // five channels per track
     let tracksData = [];
     let currentPatternIndex = 0;
@@ -166,7 +159,6 @@
     const orchestraEl   = document.getElementById("orchestra");
     const instrumentsEl = document.getElementById("instruments");
     const patternEditEl = document.getElementById("patternedit");
-    const pageDisplayEl = document.getElementById("pageDisplay");
     
     /***************************************************
      * Helper Functions
@@ -189,28 +181,14 @@
     }, 200);
     
     /***************************************************
-     * Step Page Controls
-     ***************************************************/
-    function updatePageDisplay() {
-      const start = stepPage * stepsPerPage;
-      const end = Math.min(start + stepsPerPage - 1, stepsPerPattern - 1);
-      pageDisplayEl.textContent = `Steps ${start}-${end}`;
-    }
-    function prevStepPage() {
-      if (stepPage > 0) { stepPage--; readPattern(); updatePageDisplay(); }
-    }
-    function nextStepPage() {
-      if ((stepPage+1)*stepsPerPage < stepsPerPattern) { stepPage++; readPattern(); updatePageDisplay(); }
-    }
-    
-    /***************************************************
      * Clock Worker Setup
      ***************************************************/
     let clockWorker = null;
     function initClockWorker() {
+      // Note: update the worker code so stepsPerPattern is 512.
       const workerCode = `
         let bpm = 120, currentStep = 0, running = false, nextTickTime = 0;
-        const stepsPerPattern = 256;
+        const stepsPerPattern = 512;
         function scheduleTick() {
           if (!running) return;
           const now = performance.now();
@@ -243,7 +221,9 @@
       const blob = new Blob([workerCode], { type: 'application/javascript' });
       const workerURL = URL.createObjectURL(blob);
       clockWorker = new Worker(workerURL);
-      clockWorker.onmessage = (e) => { if (e.data.type === 'tick') updateStep(e.data.step); };
+      clockWorker.onmessage = (e) => {
+        if (e.data.type === 'tick') updateStep(e.data.step);
+      };
     }
     
     /***************************************************
@@ -254,8 +234,6 @@
       tracksData = [];
       currentPatternIndex = 0;
       currentStepJS = 0;
-      stepPage = 0;
-      updatePageDisplay();
       // Initialize 8 tracks.
       for (let i = 1; i <= 8; i++) { tracksData.push(generateTrack(i)); }
       readPattern();
@@ -264,12 +242,10 @@
     window.onload = () => { initializeEditor(); initClockWorker(); };
     
     /***************************************************
-     * Global Shortcuts
+     * Global Shortcut (CTRL+E to Compile)
      ***************************************************/
     document.addEventListener("keydown", (e) => {
       if (e.ctrlKey && e.key.toLowerCase() === "e") { e.preventDefault(); compile(); }
-      if (e.key === "ArrowLeft") { prevStepPage(); }
-      if (e.key === "ArrowRight") { nextStepPage(); }
     });
     
     /***************************************************
@@ -287,25 +263,22 @@
       return orcCode;
     }
     // Generate Csound events for a given step.
-    // Map: first column (A) becomes note length multiplier (p4),
-    // second column (B) is instrument number,
-    // columns C, D, E become p5, p6, p7.
-    // If either A or B is "00", no event is triggered.
+    // Mapping:
+    // - Channel A (first "00") is used as the note–length multiplier (p4); if its value is "00", no event.
+    // - Channel B (second "00") is used as the instrument number; if "00", no event.
+    // - Channels C, D, E become p5, p6, p7.
+    // If channel A is "^^", we default multiplier to 1.
     function generateEventsForStep(stepIndex) {
       tracksData.forEach((track, tIndex) => {
         const pat = track.patterns[currentPatternIndex];
         let A = pat.A[stepIndex];
         let B = pat.B[stepIndex];
-        // Skip event if note or instrument is "00"
         if (A === "00" || B === "00") return;
         let C = pat.C[stepIndex];
         let D = pat.D[stepIndex];
         let E = pat.E[stepIndex];
-        // Compute note length in seconds; if A is "^^", default multiplier 1.
         let mult = (A === "^^" || isNaN(parseInt(A))) ? 1 : parseInt(A);
         let noteLength = (mult * (60/currentBPM)).toFixed(3);
-        // Generate event string:
-        // p4 = note length, p5 = C, p6 = D, p7 = E.
         let eventStr = "i" + B + " 0 " + noteLength + " " + C + " " + D + " " + E;
         csound.Event(eventStr);
       });
@@ -315,7 +288,7 @@
      * Playback and Clock Functions
      ***************************************************/
     function updateStep(step) {
-      if (step === 0 && prevStep === 255) {
+      if (step === 0 && prevStep === 511) {
         if (document.getElementById("loopCheckbox").checked) {
           currentPatternIndex = (currentPatternIndex < loopEnd) ? currentPatternIndex + 1 : loopStart;
           readPattern();
@@ -327,9 +300,11 @@
       prevStep = step;
       currentStepJS = step;
       csound.SetChannel("stepvalue", currentStepJS);
-      // Generate events only for the current global step.
       generateEventsForStep(currentStepJS);
-      updatePatternCounter();
+      // Beat counter: 1 beat per 16 steps.
+      const currentBeat = Math.floor(currentStepJS / 16) + 1;
+      document.getElementById("patternCounter").textContent =
+        `Pattern: ${currentPatternIndex + 1}/${getTotalPatterns()} | Beat: ${currentBeat} | BPM: ${currentBPM}`;
       if (window.csound && typeof window.csound.setControlChannel === "function") {
         window.csound.setControlChannel("stepcount", currentStepJS);
       }
@@ -354,18 +329,17 @@
     function playCsound() { writePattern(); updateCsoundMatrix(); readPattern(); }
     function stopCsound() {
       if (clockWorker) { clockWorker.postMessage({ type: "stop" }); }
-      updatePatternCounter();
       document.getElementById("playToggle").textContent = "Play";
       isPlaying = false;
     }
     function updateBPM() {
       currentBPM = parseInt(document.getElementById("bpmSlider").value, 10);
       bpmBuffer = currentBPM;
-      updatePatternCounter();
-      if (window.Csound && typeof window.Csound.setChannel === "function") {
-        window.Csound.setChannel("bpm", currentBPM);
-      }
       if (clockWorker && isPlaying) { clockWorker.postMessage({ type: "updateBpm", bpm: currentBPM }); }
+      // Update beat display:
+      const currentBeat = Math.floor(currentStepJS / 16) + 1;
+      document.getElementById("patternCounter").textContent =
+        `Pattern: ${currentPatternIndex + 1}/${getTotalPatterns()} | Beat: ${currentBeat} | BPM: ${currentBPM}`;
     }
     
     /***************************************************
@@ -396,26 +370,15 @@
       };
     }
     function updatePatternCounter() {
-      const totalPatterns = getTotalPatterns();
       const currentBeat = Math.floor(currentStepJS / 16) + 1;
       document.getElementById("patternCounter").textContent =
-        `Pattern: ${currentPatternIndex + 1}/${totalPatterns} | Beat: ${currentBeat} | BPM: ${currentBPM}`;
-      const totalSteps = totalPatterns * stepsPerPattern;
-      const absoluteStep = currentPatternIndex * stepsPerPattern + currentStepJS;
-      const slider = document.getElementById("patternSlider");
-      if (slider) {
-        slider.min = 0;
-        slider.max = totalSteps - 1;
-        if (parseInt(slider.value, 10) !== absoluteStep) { slider.value = absoluteStep; }
-      }
-      document.getElementById("loopStart").max = totalPatterns;
-      document.getElementById("loopEnd").max = totalPatterns;
+        `Pattern: ${currentPatternIndex + 1}/${getTotalPatterns()} | Beat: ${currentBeat} | BPM: ${currentBPM}`;
     }
     
     /***************************************************
      * Pattern Editor – Grid Rendering and Editing
      ***************************************************/
-    // Render the header row and only 4 visible step rows (according to stepPage)
+    // Renders all 512 steps.
     function readPattern() {
       if (tracksData.length === 0) { patternEditEl.value = ""; updatePatternCounter(); return; }
       let headerLine = "|***|";
@@ -423,9 +386,7 @@
       headerLine += "\n";
       
       let textOutput = headerLine;
-      const startStep = stepPage * stepsPerPage;
-      const endStep = Math.min(startStep + stepsPerPage, stepsPerPattern);
-      for (let step = startStep; step < endStep; step++) {
+      for (let step = 0; step < stepsPerPattern; step++) {
         let line = "|" + step.toString().padStart(3, '0') + "|";
         tracksData.forEach(track => {
           const pat = track.patterns[currentPatternIndex] || initializePattern();
@@ -439,15 +400,13 @@
       updatePatternCounter();
     }
     
-    // Parse the visible grid back into the data model.
+    // Parses the grid (all 512 rows) back into the model.
     function writePattern() {
       if (tracksData.length === 0) return;
       const lines = patternEditEl.value.split("\n").filter(line => line.trim() !== "");
       if (lines.length < 2) return;
       lines.shift(); // remove header
-      const startStep = stepPage * stepsPerPage;
-      lines.forEach((line, i) => {
-        const step = startStep + i;
+      lines.forEach((line, step) => {
         const parts = line.split("|").filter(p => p !== "");
         parts.slice(1).forEach((cell, tIndex) => {
           const values = cell.split(",");
@@ -464,10 +423,9 @@
       updateCsoundMatrix();
     }
     
-    // Keydown handler:
-    // – Only digits and '^' are allowed in editable positions.
-    // – Editable offsets within each cell (15 characters per cell): positions 0-1, 3-4, 6-7, 9-10, 12-13.
-    // – When data is inserted, the caret is reset to the beginning of that cell.
+    // Keydown handler: Only digits and '^' are allowed in editable positions.
+    // Editable positions in each cell ("00,00,00,00,00"): positions 0-1, 3-4, 6-7, 9-10, 12-13.
+    // When you finish typing a digit (or '^'), the new value is inserted and the caret remains in that cell.
     patternEditEl.addEventListener("keydown", function(e) {
       if (e.ctrlKey && e.key.toLowerCase() === "e") { e.preventDefault(); compile(); return; }
       if (e.key.length !== 1) return;
@@ -480,16 +438,15 @@
         if (pos + lines[i].length + 1 > caret) { lineIndex = i; break; }
         pos += lines[i].length + 1;
       }
-      if (lineIndex === 0) { e.preventDefault(); return; } // header non-editable
+      if (lineIndex === 0) { e.preventDefault(); return; }
       let col = caret - pos;
-      if (col < 5) { e.preventDefault(); return; } // step counter non-editable
+      if (col < 5) { e.preventDefault(); return; }
       
       // Each track cell occupies 15 characters.
       let cellIndex = Math.floor((col - 5) / 15);
       let cellStart = 5 + cellIndex * 15;
       let offset = col - cellStart;
       
-      // Allowed editable offsets: 0-1 for channel A, 3-4 for B, 6-7 for C, 9-10 for D, 12-13 for E.
       let channel = null, digitIndex = null;
       if (offset >= 0 && offset <= 1) { channel = "A"; digitIndex = offset; }
       else if (offset >= 3 && offset <= 4) { channel = "B"; digitIndex = offset - 3; }
@@ -498,20 +455,20 @@
       else if (offset >= 12 && offset <= 13) { channel = "E"; digitIndex = offset - 12; }
       else { e.preventDefault(); return; }
       
-      const step = stepPage * stepsPerPage + (lineIndex - 1);
+      const step = caret === 0 ? 0 : parseInt(lines[lineIndex].slice(1,4));
       if (cellIndex < 0 || cellIndex >= tracksData.length) { e.preventDefault(); return; }
       
       const track = tracksData[cellIndex];
       let currentVal = track.patterns[currentPatternIndex][channel][step];
       if (currentVal.length < 2) { currentVal = (currentVal + "0").slice(0,2); }
       let newValArr = currentVal.split('');
-      if (e.key === "^") { newValArr = ["^", "^"]; }
+      if (e.key === "^") { newValArr = ["^","^"]; }
       else { newValArr[digitIndex] = e.key; }
       track.patterns[currentPatternIndex][channel][step] = newValArr.join('');
       
       e.preventDefault();
       writePattern();
-      // Reset caret to the beginning of the editable area for this cell.
+      // Reset caret to the beginning of this cell's editable region.
       patternEditEl.selectionStart = patternEditEl.selectionEnd = cellStart;
     });
     
