@@ -86,9 +86,9 @@
 </head>
 <body>
   <div class="container">
-    <!-- Read-only Csound Console -->
+    <!-- Csound Console (read-only) -->
     <textarea id="console" readonly rows="4">Csound: not loaded</textarea>
-    <!-- Read-only Orchestra Code -->
+    <!-- Orchestra Code (read-only) -->
     <textarea id="orchestra"></textarea>
     <!-- Control Panel -->
     <div class="controls">
@@ -101,13 +101,11 @@
       <label for="loopEnd">Loop To:</label>
       <input type="number" id="loopEnd" min="1" value="1" style="width:30px" onchange="validateLoopRange()">
       <div>
-        Examples: 
+        <!-- Example song buttons and other controls -->
         <button onclick="loadExampleSong('1.bin')">1</button>
         <button onclick="loadExampleSong('2.bin')">2</button>
         <button onclick="loadExampleSong('3.bin')">3</button>
         <button onclick="loadExampleSong('4.bin')">4</button>
-        <button onclick="addPattern()">+ Pattern</button>
-        <button onclick="removePattern()">– Pattern</button>
         <button onclick="copyPattern()">Insert Copy</button>
         <button onclick="copyToBuffer()">Copy</button>
         <button onclick="pasteFromBuffer()">Paste</button>
@@ -119,29 +117,24 @@
         <button onclick="compile()">Compile</button>
       </div>
     </div>
-    <!-- Pattern Counter now shows beat number (1 beat = 16 steps) -->
+    <!-- Pattern Counter: displays current beat (1 beat = 16 steps) -->
     <span id="patternCounter">Pattern: 1/1 | Beat: 1 | BPM: 120</span>
-    <!-- Editable Pattern Editor.
-         Header row: |***| followed by each track’s header (e.g. "######01######"|...|######08######|)
-         Then 512 step rows. Each row begins with the step counter (e.g. "|000|") and then one cell per track formatted as "00,00,00,00,00".
-         Special characters (|, commas, asterisks) are non-editable.
-         In each cell, when you insert a value (or '^'), the digit overwrites that location and then the caret stays in that cell.
-         (You can use arrow keys to reposition if needed.) -->
-    <textarea class="code" id="patternedit" placeholder="Pattern Editor"></textarea>
-    <!-- Read-only Csound Function Table Output -->
+    <!-- Pattern Editor (shows all 512 steps) -->
+    <textarea id="patternedit" class="code" placeholder="Pattern Editor"></textarea>
+    <!-- Csound Function Table Output (read-only) -->
     <textarea id="instruments" readonly placeholder="Csound Array Output"></textarea>
   </div>
   
   <!-- Hidden File Input -->
   <input type="file" id="loadInput" style="display:none" onchange="loadPatternData(event)">
   
-  <!-- Include csound.js (ensure correct path) -->
+  <!-- Include csound.js (ensure the path is correct) -->
   <script src="csound.js"></script>
   <script>
     /***************************************************
      * Global Variables and Cached Elements
      ***************************************************/
-    const stepsPerPattern = 512;  // now 512 steps per pattern
+    const stepsPerPattern = 512; // full pattern length
     const channels = ["A", "B", "C", "D", "E"]; // five channels per track
     let tracksData = [];
     let currentPatternIndex = 0;
@@ -166,26 +159,156 @@
     function getTotalPatterns() {
       return tracksData.length > 0 ? tracksData[0].patterns.length : 0;
     }
-    function getTotalSteps() {
-      return getTotalPatterns() * stepsPerPattern;
+    
+    function updatePatternCounter() {
+      const currentBeat = Math.floor(currentStepJS / 16) + 1;
+      document.getElementById("patternCounter").textContent =
+        `Pattern: ${currentPatternIndex+1}/${getTotalPatterns()} | Beat: ${currentBeat} | BPM: ${currentBPM}`;
     }
-    function debounce(func, wait) {
-      let timeout;
-      return function(...args) {
-        clearTimeout(timeout);
-        timeout = setTimeout(() => func.apply(this, args), wait);
-      };
-    }
-    const debouncedUpdateInstruments = debounce(() => {
-      csound.compileOrc(instrumentsEl.value);
-    }, 200);
     
     /***************************************************
-     * Clock Worker Setup
+     * Data Model Functions
      ***************************************************/
-    let clockWorker = null;
+    function initializePattern() {
+      return {
+        A: new Array(stepsPerPattern).fill("00"),
+        B: new Array(stepsPerPattern).fill("00"),
+        C: new Array(stepsPerPattern).fill("00"),
+        D: new Array(stepsPerPattern).fill("00"),
+        E: new Array(stepsPerPattern).fill("00")
+      };
+    }
+    
+    function deepCopyPattern(pattern) {
+      return {
+        A: [...pattern.A],
+        B: [...pattern.B],
+        C: [...pattern.C],
+        D: [...pattern.D],
+        E: [...pattern.E]
+      };
+    }
+    
+    function generateTrack(id) {
+      return {
+        header: `######${id.toString().padStart(2, '0')}######`,
+        patterns: [initializePattern()]
+      };
+    }
+    
+    /***************************************************
+     * Pattern Editor Rendering and Parsing
+     ***************************************************/
+    // The pattern editor renders a header row followed by one row per step.
+    // Each header row: |***| followed by each track’s header.
+    // Each data row: begins with the step counter (3 digits) and then for each track a cell formatted as "00,00,00,00,00"
+    function readPattern() {
+      let headerLine = "|***|";
+      tracksData.forEach(track => { headerLine += track.header + "|"; });
+      headerLine += "\n";
+      
+      let textOutput = headerLine;
+      for (let step = 0; step < stepsPerPattern; step++) {
+        let line = "|" + step.toString().padStart(3, '0') + "|";
+        tracksData.forEach(track => {
+          const pat = track.patterns[currentPatternIndex] || initializePattern();
+          let cell = [pat.A[step], pat.B[step], pat.C[step], pat.D[step], pat.E[step]].join(",");
+          line += cell + "|";
+        });
+        textOutput += line + "\n";
+      }
+      patternEditEl.value = textOutput;
+      updateCsoundMatrix();
+      updatePatternCounter();
+    }
+    
+    // Parse the entire editor content back into the data model.
+    function writePattern() {
+      const lines = patternEditEl.value.split("\n").filter(line => line.trim() !== "");
+      if (lines.length < 2) return;
+      lines.shift(); // remove header row
+      lines.forEach((line, step) => {
+        const parts = line.split("|").filter(p => p !== "");
+        // parts[0] is the step counter; then parts[1..] are track cells.
+        parts.slice(1).forEach((cell, tIndex) => {
+          const values = cell.split(",");
+          if (values.length === 5) {
+            const pat = tracksData[tIndex].patterns[currentPatternIndex];
+            pat.A[step] = values[0];
+            pat.B[step] = values[1];
+            pat.C[step] = values[2];
+            pat.D[step] = values[3];
+            pat.E[step] = values[4];
+          }
+        });
+      });
+      updateCsoundMatrix();
+    }
+    
+    /***************************************************
+     * Pattern Editor Input Handling
+     ***************************************************/
+    // Each track cell is assumed to occupy 15 characters:
+    // "00,00,00,00,00" (14 characters) plus the trailing divider.
+    // In each cell, only positions 0-1 (channel A), 3-4 (B), 6-7 (C), 9-10 (D), 12-13 (E) are editable.
+    // When you type a digit (or '^'), it overwrites the character at that position and the caret remains in that cell.
+    patternEditEl.addEventListener("keydown", function(e) {
+      if (e.ctrlKey && e.key.toLowerCase() === "e") { e.preventDefault(); compile(); return; }
+      if (e.key.length !== 1) return;
+      if (!/[0-9^]/.test(e.key)) { e.preventDefault(); return; }
+      
+      const caret = this.selectionStart;
+      const lines = this.value.split("\n");
+      let pos = 0, lineIndex = 0;
+      for (let i = 0; i < lines.length; i++) {
+        if (pos + lines[i].length + 1 > caret) { lineIndex = i; break; }
+        pos += lines[i].length + 1;
+      }
+      // Do not allow editing in header row.
+      if (lineIndex === 0) { e.preventDefault(); return; }
+      let col = caret - pos;
+      // The first 5 characters (e.g. "|000|") are non-editable.
+      if (col < 5) { e.preventDefault(); return; }
+      
+      // Each track cell occupies 15 characters.
+      let cellIndex = Math.floor((col - 5) / 15);
+      let cellStart = 5 + cellIndex * 15;
+      let offset = col - cellStart;
+      
+      // Allowed editable offsets: 0-1 (A), 3-4 (B), 6-7 (C), 9-10 (D), 12-13 (E)
+      let channel = null, digitIndex = null;
+      if (offset >= 0 && offset <= 1) { channel = "A"; digitIndex = offset; }
+      else if (offset >= 3 && offset <= 4) { channel = "B"; digitIndex = offset - 3; }
+      else if (offset >= 6 && offset <= 7) { channel = "C"; digitIndex = offset - 6; }
+      else if (offset >= 9 && offset <= 10) { channel = "D"; digitIndex = offset - 9; }
+      else if (offset >= 12 && offset <= 13) { channel = "E"; digitIndex = offset - 12; }
+      else { e.preventDefault(); return; }
+      
+      // Extract the step number from the row.
+      const line = lines[lineIndex];
+      const step = parseInt(line.slice(1,4));
+      if (isNaN(step)) { e.preventDefault(); return; }
+      
+      if (cellIndex < 0 || cellIndex >= tracksData.length) { e.preventDefault(); return; }
+      
+      const track = tracksData[cellIndex];
+      let currentVal = track.patterns[currentPatternIndex][channel][step];
+      if (currentVal.length < 2) { currentVal = (currentVal + "0").slice(0,2); }
+      let newValArr = currentVal.split('');
+      if (e.key === "^") { newValArr = ["^", "^"]; }
+      else { newValArr[digitIndex] = e.key; }
+      track.patterns[currentPatternIndex][channel][step] = newValArr.join('');
+      
+      e.preventDefault();
+      writePattern();
+      // Restore caret to the beginning of the cell's editable area.
+      patternEditEl.selectionStart = patternEditEl.selectionEnd = cellStart;
+    });
+    
+    /***************************************************
+     * Clock Worker and Playback
+     ***************************************************/
     function initClockWorker() {
-      // Note: update the worker code so stepsPerPattern is 512.
       const workerCode = `
         let bpm = 120, currentStep = 0, running = false, nextTickTime = 0;
         const stepsPerPattern = 512;
@@ -221,53 +344,77 @@
       const blob = new Blob([workerCode], { type: 'application/javascript' });
       const workerURL = URL.createObjectURL(blob);
       clockWorker = new Worker(workerURL);
-      clockWorker.onmessage = (e) => {
-        if (e.data.type === 'tick') updateStep(e.data.step);
-      };
+      clockWorker.onmessage = (e) => { if(e.data.type==='tick') updateStep(e.data.step); };
     }
     
-    /***************************************************
-     * Editor and Data Initialization
-     ***************************************************/
-    function initializeEditor() {
-      orchestraEl.value = updateCsoundOrc();
-      tracksData = [];
-      currentPatternIndex = 0;
-      currentStepJS = 0;
-      // Initialize 8 tracks.
-      for (let i = 1; i <= 8; i++) { tracksData.push(generateTrack(i)); }
+    function updateStep(step) {
+      // When a full cycle is completed:
+      if (step === 0 && prevStep === 511) {
+        if (document.getElementById("loopCheckbox").checked) {
+          currentPatternIndex = (currentPatternIndex < loopEnd) ? currentPatternIndex + 1 : loopStart;
+          readPattern();
+        } else {
+          if (currentPatternIndex >= getTotalPatterns()-1) { stopCsound(); return; }
+          else { currentPatternIndex++; readPattern(); }
+        }
+      }
+      prevStep = step;
+      currentStepJS = step;
+      csound.SetChannel("stepvalue", currentStepJS);
+      generateEventsForStep(currentStepJS);
+      const currentBeat = Math.floor(currentStepJS/16) + 1;
+      document.getElementById("patternCounter").textContent =
+        `Pattern: ${currentPatternIndex+1}/${getTotalPatterns()} | Beat: ${currentBeat} | BPM: ${currentBPM}`;
+      if(window.csound && typeof window.csound.setControlChannel === "function"){
+        window.csound.setControlChannel("stepcount", currentStepJS);
+      }
+    }
+    
+    function togglePlay() {
+      compile();
+      if (isPlaying) {
+        stopCsound();
+        document.getElementById("playToggle").textContent = "Play";
+        isPlaying = false;
+      } else {
+        currentBPM = bpmBuffer;
+        document.getElementById("bpmSlider").value = currentBPM;
+        playCsound();
+        document.getElementById("playToggle").textContent = "Stop";
+        isPlaying = true;
+        if (clockWorker) { clockWorker.postMessage({ type: "start", bpm: currentBPM }); }
+      }
+    }
+    
+    function playCsound() {
+      writePattern();
+      updateCsoundMatrix();
       readPattern();
-      updateLoopRangeDefaults();
     }
-    window.onload = () => { initializeEditor(); initClockWorker(); };
+    
+    function stopCsound() {
+      if (clockWorker) { clockWorker.postMessage({ type: "stop" }); }
+      document.getElementById("playToggle").textContent = "Play";
+      isPlaying = false;
+    }
+    
+    function updateBPM() {
+      currentBPM = parseInt(document.getElementById("bpmSlider").value, 10);
+      bpmBuffer = currentBPM;
+      if (clockWorker && isPlaying) { clockWorker.postMessage({ type: "updateBpm", bpm: currentBPM }); }
+      const currentBeat = Math.floor(currentStepJS/16)+1;
+      document.getElementById("patternCounter").textContent =
+        `Pattern: ${currentPatternIndex+1}/${getTotalPatterns()} | Beat: ${currentBeat} | BPM: ${currentBPM}`;
+    }
     
     /***************************************************
-     * Global Shortcut (CTRL+E to Compile)
+     * Csound Event Generation
      ***************************************************/
-    document.addEventListener("keydown", (e) => {
-      if (e.ctrlKey && e.key.toLowerCase() === "e") { e.preventDefault(); compile(); }
-    });
-    
-    /***************************************************
-     * Csound Integration Functions
-     ***************************************************/
-    function moduleDidLoad() { csound.Play(); compile(); }
-    function compile() {
-      csound.compileOrc(instrumentsEl.value);
-      csound.compileOrc(orchestraEl.value);
-    }
-    function updateCsoundOrc() {
-      let orcCode = "";
-      for (let i = 1; i <= 16; i++) { orcCode += `instr ${i}\n  \nendin\n\n`; }
-      orcCode += `instr 17\n gkstepinput chnget "stepvalue"\n  \nendin\n\n`;
-      return orcCode;
-    }
-    // Generate Csound events for a given step.
-    // Mapping:
-    // - Channel A (first "00") is used as the note–length multiplier (p4); if its value is "00", no event.
-    // - Channel B (second "00") is used as the instrument number; if "00", no event.
-    // - Channels C, D, E become p5, p6, p7.
-    // If channel A is "^^", we default multiplier to 1.
+    // Map channels:
+    // Channel A (first "00") is the note–length multiplier (p4)
+    // Channel B (second "00") is the instrument number
+    // Channels C, D, E become p5, p6, p7.
+    // Do not trigger an event if either A or B is "00".
     function generateEventsForStep(stepIndex) {
       tracksData.forEach((track, tIndex) => {
         const pat = track.patterns[currentPatternIndex];
@@ -285,231 +432,20 @@
     }
     
     /***************************************************
-     * Playback and Clock Functions
-     ***************************************************/
-    function updateStep(step) {
-      if (step === 0 && prevStep === 511) {
-        if (document.getElementById("loopCheckbox").checked) {
-          currentPatternIndex = (currentPatternIndex < loopEnd) ? currentPatternIndex + 1 : loopStart;
-          readPattern();
-        } else {
-          if (currentPatternIndex >= getTotalPatterns() - 1) { stopCsound(); return; }
-          else { currentPatternIndex++; readPattern(); }
-        }
-      }
-      prevStep = step;
-      currentStepJS = step;
-      csound.SetChannel("stepvalue", currentStepJS);
-      generateEventsForStep(currentStepJS);
-      // Beat counter: 1 beat per 16 steps.
-      const currentBeat = Math.floor(currentStepJS / 16) + 1;
-      document.getElementById("patternCounter").textContent =
-        `Pattern: ${currentPatternIndex + 1}/${getTotalPatterns()} | Beat: ${currentBeat} | BPM: ${currentBPM}`;
-      if (window.csound && typeof window.csound.setControlChannel === "function") {
-        window.csound.setControlChannel("stepcount", currentStepJS);
-      }
-    }
-    function togglePlay() {
-      compile();
-      if (isPlaying) {
-        CsoundObj.CSOUND_AUDIO_CONTEXT.resume();
-        stopCsound();
-        document.getElementById("playToggle").textContent = "Play";
-        isPlaying = false;
-        if (clockWorker) { clockWorker.postMessage({ type: "stop" }); }
-      } else {
-        currentBPM = bpmBuffer;
-        document.getElementById("bpmSlider").value = currentBPM;
-        playCsound();
-        document.getElementById("playToggle").textContent = "Stop";
-        isPlaying = true;
-        if (clockWorker) { clockWorker.postMessage({ type: "start", bpm: currentBPM }); }
-      }
-    }
-    function playCsound() { writePattern(); updateCsoundMatrix(); readPattern(); }
-    function stopCsound() {
-      if (clockWorker) { clockWorker.postMessage({ type: "stop" }); }
-      document.getElementById("playToggle").textContent = "Play";
-      isPlaying = false;
-    }
-    function updateBPM() {
-      currentBPM = parseInt(document.getElementById("bpmSlider").value, 10);
-      bpmBuffer = currentBPM;
-      if (clockWorker && isPlaying) { clockWorker.postMessage({ type: "updateBpm", bpm: currentBPM }); }
-      // Update beat display:
-      const currentBeat = Math.floor(currentStepJS / 16) + 1;
-      document.getElementById("patternCounter").textContent =
-        `Pattern: ${currentPatternIndex + 1}/${getTotalPatterns()} | Beat: ${currentBeat} | BPM: ${currentBPM}`;
-    }
-    
-    /***************************************************
-     * Data Model Functions
-     ***************************************************/
-    function initializePattern() {
-      return {
-        A: new Array(stepsPerPattern).fill("00"),
-        B: new Array(stepsPerPattern).fill("00"),
-        C: new Array(stepsPerPattern).fill("00"),
-        D: new Array(stepsPerPattern).fill("00"),
-        E: new Array(stepsPerPattern).fill("00")
-      };
-    }
-    function deepCopyPattern(pattern) {
-      return {
-        A: [...pattern.A],
-        B: [...pattern.B],
-        C: [...pattern.C],
-        D: [...pattern.D],
-        E: [...pattern.E]
-      };
-    }
-    function generateTrack(id) {
-      return {
-        header: `######${id.toString().padStart(2, '0')}######`,
-        patterns: [initializePattern()]
-      };
-    }
-    function updatePatternCounter() {
-      const currentBeat = Math.floor(currentStepJS / 16) + 1;
-      document.getElementById("patternCounter").textContent =
-        `Pattern: ${currentPatternIndex + 1}/${getTotalPatterns()} | Beat: ${currentBeat} | BPM: ${currentBPM}`;
-    }
-    
-    /***************************************************
-     * Pattern Editor – Grid Rendering and Editing
-     ***************************************************/
-    // Renders all 512 steps.
-    function readPattern() {
-      if (tracksData.length === 0) { patternEditEl.value = ""; updatePatternCounter(); return; }
-      let headerLine = "|***|";
-      tracksData.forEach(track => { headerLine += track.header + "|"; });
-      headerLine += "\n";
-      
-      let textOutput = headerLine;
-      for (let step = 0; step < stepsPerPattern; step++) {
-        let line = "|" + step.toString().padStart(3, '0') + "|";
-        tracksData.forEach(track => {
-          const pat = track.patterns[currentPatternIndex] || initializePattern();
-          let cell = [pat.A[step], pat.B[step], pat.C[step], pat.D[step], pat.E[step]].join(",");
-          line += cell + "|";
-        });
-        textOutput += line + "\n";
-      }
-      patternEditEl.value = textOutput;
-      updateCsoundMatrix();
-      updatePatternCounter();
-    }
-    
-    // Parses the grid (all 512 rows) back into the model.
-    function writePattern() {
-      if (tracksData.length === 0) return;
-      const lines = patternEditEl.value.split("\n").filter(line => line.trim() !== "");
-      if (lines.length < 2) return;
-      lines.shift(); // remove header
-      lines.forEach((line, step) => {
-        const parts = line.split("|").filter(p => p !== "");
-        parts.slice(1).forEach((cell, tIndex) => {
-          const values = cell.split(",");
-          if (values.length === 5) {
-            const pat = tracksData[tIndex].patterns[currentPatternIndex];
-            pat.A[step] = values[0];
-            pat.B[step] = values[1];
-            pat.C[step] = values[2];
-            pat.D[step] = values[3];
-            pat.E[step] = values[4];
-          }
-        });
-      });
-      updateCsoundMatrix();
-    }
-    
-    // Keydown handler: Only digits and '^' are allowed in editable positions.
-    // Editable positions in each cell ("00,00,00,00,00"): positions 0-1, 3-4, 6-7, 9-10, 12-13.
-    // When you finish typing a digit (or '^'), the new value is inserted and the caret remains in that cell.
-    patternEditEl.addEventListener("keydown", function(e) {
-      if (e.ctrlKey && e.key.toLowerCase() === "e") { e.preventDefault(); compile(); return; }
-      if (e.key.length !== 1) return;
-      if (!/[0-9^]/.test(e.key)) { e.preventDefault(); return; }
-      
-      const caret = this.selectionStart;
-      const lines = this.value.split("\n");
-      let pos = 0, lineIndex = 0;
-      for (let i = 0; i < lines.length; i++) {
-        if (pos + lines[i].length + 1 > caret) { lineIndex = i; break; }
-        pos += lines[i].length + 1;
-      }
-      if (lineIndex === 0) { e.preventDefault(); return; }
-      let col = caret - pos;
-      if (col < 5) { e.preventDefault(); return; }
-      
-      // Each track cell occupies 15 characters.
-      let cellIndex = Math.floor((col - 5) / 15);
-      let cellStart = 5 + cellIndex * 15;
-      let offset = col - cellStart;
-      
-      let channel = null, digitIndex = null;
-      if (offset >= 0 && offset <= 1) { channel = "A"; digitIndex = offset; }
-      else if (offset >= 3 && offset <= 4) { channel = "B"; digitIndex = offset - 3; }
-      else if (offset >= 6 && offset <= 7) { channel = "C"; digitIndex = offset - 6; }
-      else if (offset >= 9 && offset <= 10) { channel = "D"; digitIndex = offset - 9; }
-      else if (offset >= 12 && offset <= 13) { channel = "E"; digitIndex = offset - 12; }
-      else { e.preventDefault(); return; }
-      
-      const step = caret === 0 ? 0 : parseInt(lines[lineIndex].slice(1,4));
-      if (cellIndex < 0 || cellIndex >= tracksData.length) { e.preventDefault(); return; }
-      
-      const track = tracksData[cellIndex];
-      let currentVal = track.patterns[currentPatternIndex][channel][step];
-      if (currentVal.length < 2) { currentVal = (currentVal + "0").slice(0,2); }
-      let newValArr = currentVal.split('');
-      if (e.key === "^") { newValArr = ["^","^"]; }
-      else { newValArr[digitIndex] = e.key; }
-      track.patterns[currentPatternIndex][channel][step] = newValArr.join('');
-      
-      e.preventDefault();
-      writePattern();
-      // Reset caret to the beginning of this cell's editable region.
-      patternEditEl.selectionStart = patternEditEl.selectionEnd = cellStart;
-    });
-    
-    /***************************************************
-     * Loop Range Controls
-     ***************************************************/
-    function validateLoopRange() {
-      const total = getTotalPatterns();
-      let ls = parseInt(document.getElementById("loopStart").value, 10);
-      let le = parseInt(document.getElementById("loopEnd").value, 10);
-      if (isNaN(ls) || ls < 1) ls = 1;
-      if (isNaN(le) || le < 1) le = 1;
-      if (ls > total) ls = total;
-      if (le > total) le = total;
-      if (ls > le) ls = le;
-      document.getElementById("loopStart").value = ls;
-      document.getElementById("loopEnd").value = le;
-      loopStart = ls - 1;
-      loopEnd = le - 1;
-    }
-    function updateLoopRangeDefaults() {
-      const total = getTotalPatterns();
-      document.getElementById("loopStart").value = 1;
-      document.getElementById("loopEnd").value = total;
-      loopStart = 0;
-      loopEnd = total - 1;
-    }
-    
-    /***************************************************
-     * Pattern and Track Navigation
+     * Pattern and Track Navigation & File I/O
      ***************************************************/
     function previousPattern() {
       writePattern();
       if (currentPatternIndex > 0) { currentPatternIndex--; readPattern(); }
       else { alert("Already at the first pattern."); }
     }
+    
     function nextPattern() {
       writePattern();
       if (currentPatternIndex < tracksData[0].patterns.length - 1) { currentPatternIndex++; readPattern(); }
       else { alert("Already at the last pattern."); }
     }
+    
     function copyPattern() {
       writePattern();
       tracksData.forEach(track => {
@@ -520,15 +456,13 @@
       readPattern();
     }
     
-    /***************************************************
-     * Copy and Paste Functions
-     ***************************************************/
     function copyToBuffer() {
       writePattern();
       patternBuffer = [];
       tracksData.forEach(track => { patternBuffer.push(deepCopyPattern(track.patterns[currentPatternIndex])); });
       alert("Pattern copied to buffer.");
     }
+    
     function pasteFromBuffer() {
       if (!patternBuffer) { alert("Buffer is empty."); return; }
       writePattern();
@@ -536,9 +470,6 @@
       readPattern();
     }
     
-    /***************************************************
-     * Data Persistence Functions
-     ***************************************************/
     function savePatternData() {
       writePattern();
       const numTracks = tracksData.length;
@@ -567,6 +498,7 @@
       a.click();
       URL.revokeObjectURL(url);
     }
+    
     function loadPatternData(event) {
       const file = event.target.files[0];
       if (!file) return;
@@ -605,7 +537,6 @@
           }
           currentPatternIndex = 0;
           readPattern();
-          updateLoopRangeDefaults();
           orchestraEl.value = orchestraData;
           compile();
         } catch (err) { console.error("Error loading pattern data:", err); }
@@ -613,9 +544,6 @@
       reader.readAsArrayBuffer(file);
     }
     
-    /***************************************************
-     * Example Song Loader Function
-     ***************************************************/
     function loadExampleSong(filename) {
       fetch(filename)
         .then(response => { if (!response.ok) { throw new Error("File not found"); } return response.arrayBuffer(); })
@@ -652,16 +580,12 @@
           }
           currentPatternIndex = 0;
           readPattern();
-          updateLoopRangeDefaults();
           orchestraEl.value = orchestraData;
           compile();
         })
         .catch(err => { alert("There are no songs here, sorry."); console.error("Error loading example song:", err); });
     }
     
-    /***************************************************
-     * Song Initialization Function
-     ***************************************************/
     function songInit() {
       if (confirm("This will delete all pattern and Csound data and reinitialize the song. Proceed?")) {
         tracksData = [];
@@ -669,12 +593,17 @@
         currentStepJS = 0;
         if (clockWorker) { clockWorker.postMessage({ type: "stop" }); }
         for (let i = 1; i <= 8; i++) { tracksData.push(generateTrack(i)); }
-        updateLoopRangeDefaults();
         orchestraEl.value = updateCsoundOrc();
         readPattern();
         compile();
       }
     }
+    
+    // Initialize editor and clock worker on page load.
+    window.onload = function() {
+      initializeEditor();
+      initClockWorker();
+    };
   </script>
 </body>
 </html>
