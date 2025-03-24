@@ -59,7 +59,7 @@
       color: #33ff33;
       resize: both;
       white-space: pre;
-      overflow: auto;
+      overflow: scroll;
       text-shadow: none;
     }
     /* Specific Textareas */
@@ -86,9 +86,9 @@
 </head>
 <body>
   <div class="container">
-    <!-- Csound Console (read-only) -->
+    <!-- Read-only Csound Console -->
     <textarea id="console" readonly rows="4">Csound: not loaded</textarea>
-    <!-- Orchestra Code (read-only) -->
+    <!-- Read-only Orchestra Code -->
     <textarea id="orchestra"></textarea>
     <!-- Control Panel -->
     <div class="controls">
@@ -101,11 +101,13 @@
       <label for="loopEnd">Loop To:</label>
       <input type="number" id="loopEnd" min="1" value="1" style="width:30px" onchange="validateLoopRange()">
       <div>
-        <!-- Example song buttons and other controls -->
+        Examples: 
         <button onclick="loadExampleSong('1.bin')">1</button>
         <button onclick="loadExampleSong('2.bin')">2</button>
         <button onclick="loadExampleSong('3.bin')">3</button>
         <button onclick="loadExampleSong('4.bin')">4</button>
+        <button onclick="addPattern()">+ Pattern</button>
+        <button onclick="removePattern()">– Pattern</button>
         <button onclick="copyPattern()">Insert Copy</button>
         <button onclick="copyToBuffer()">Copy</button>
         <button onclick="pasteFromBuffer()">Paste</button>
@@ -116,25 +118,34 @@
         <button onclick="Play()">Play note</button>
         <button onclick="compile()">Compile</button>
       </div>
+      <div style="padding: 5px; margin: 5px; display: flex; align-items: center;">
+         <input type="range" id="patternSlider" min="0" max="255" value="0" oninput="selectSongStep()" style="flex-grow: 1; background-color: black; border: 1px solid #33ff33; cursor: pointer;">
+         <button id="patternDec" onclick="decrementPattern()">-</button>
+         <button id="patternInc" onclick="incrementPattern()">+</button>
+      </div>
     </div>
-    <!-- Pattern Counter: displays current beat (1 beat = 16 steps) -->
     <span id="patternCounter">Pattern: 1/1 | Beat: 1 | BPM: 120</span>
-    <!-- Pattern Editor (shows all 512 steps) -->
-    <textarea id="patternedit" class="code" placeholder="Pattern Editor"></textarea>
-    <!-- Csound Function Table Output (read-only) -->
+    <!-- Editable Pattern Editor.
+         The header row displays:
+           |***|######01######|######02######| ... |######08######|
+         Each data row starts with a step counter (e.g. |000|) followed by one track cell,
+         where each cell is formatted as "00,00,00,00,00". Divider characters (|, commas, asterisks)
+         are non‑editable. -->
+    <textarea class="code" id="patternedit" placeholder="Pattern Editor"></textarea>
+    <!-- Read-only Csound Function Table Output -->
     <textarea id="instruments" readonly placeholder="Csound Array Output"></textarea>
   </div>
   
   <!-- Hidden File Input -->
   <input type="file" id="loadInput" style="display:none" onchange="loadPatternData(event)">
   
-  <!-- Include csound.js (ensure the path is correct) -->
+  <!-- Include csound.js (ensure correct path) -->
   <script src="csound.js"></script>
   <script>
     /***************************************************
      * Global Variables and Cached Elements
      ***************************************************/
-    const stepsPerPattern = 512; // full pattern length
+    const stepsPerPattern = 256;
     const channels = ["A", "B", "C", "D", "E"]; // five channels per track
     let tracksData = [];
     let currentPatternIndex = 0;
@@ -159,159 +170,28 @@
     function getTotalPatterns() {
       return tracksData.length > 0 ? tracksData[0].patterns.length : 0;
     }
-    
-    function updatePatternCounter() {
-      const currentBeat = Math.floor(currentStepJS / 16) + 1;
-      document.getElementById("patternCounter").textContent =
-        `Pattern: ${currentPatternIndex+1}/${getTotalPatterns()} | Beat: ${currentBeat} | BPM: ${currentBPM}`;
+    function getTotalSteps() {
+      return getTotalPatterns() * stepsPerPattern;
     }
-    
-    /***************************************************
-     * Data Model Functions
-     ***************************************************/
-    function initializePattern() {
-      return {
-        A: new Array(stepsPerPattern).fill("00"),
-        B: new Array(stepsPerPattern).fill("00"),
-        C: new Array(stepsPerPattern).fill("00"),
-        D: new Array(stepsPerPattern).fill("00"),
-        E: new Array(stepsPerPattern).fill("00")
+    function debounce(func, wait) {
+      let timeout;
+      return function(...args) {
+        clearTimeout(timeout);
+        timeout = setTimeout(() => func.apply(this, args), wait);
       };
     }
-    
-    function deepCopyPattern(pattern) {
-      return {
-        A: [...pattern.A],
-        B: [...pattern.B],
-        C: [...pattern.C],
-        D: [...pattern.D],
-        E: [...pattern.E]
-      };
-    }
-    
-    function generateTrack(id) {
-      return {
-        header: `######${id.toString().padStart(2, '0')}######`,
-        patterns: [initializePattern()]
-      };
-    }
+    const debouncedUpdateInstruments = debounce(() => {
+      csound.compileOrc(instrumentsEl.value);
+    }, 200);
     
     /***************************************************
-     * Pattern Editor Rendering and Parsing
+     * Clock Worker Setup
      ***************************************************/
-    // The pattern editor renders a header row followed by one row per step.
-    // Each header row: |***| followed by each track’s header.
-    // Each data row: begins with the step counter (3 digits) and then for each track a cell formatted as "00,00,00,00,00"
-    function readPattern() {
-      let headerLine = "|***|";
-      tracksData.forEach(track => { headerLine += track.header + "|"; });
-      headerLine += "\n";
-      
-      let textOutput = headerLine;
-      for (let step = 0; step < stepsPerPattern; step++) {
-        let line = "|" + step.toString().padStart(3, '0') + "|";
-        tracksData.forEach(track => {
-          const pat = track.patterns[currentPatternIndex] || initializePattern();
-          let cell = [pat.A[step], pat.B[step], pat.C[step], pat.D[step], pat.E[step]].join(",");
-          line += cell + "|";
-        });
-        textOutput += line + "\n";
-      }
-      patternEditEl.value = textOutput;
-      updateCsoundMatrix();
-      updatePatternCounter();
-    }
-    
-    // Parse the entire editor content back into the data model.
-    function writePattern() {
-      const lines = patternEditEl.value.split("\n").filter(line => line.trim() !== "");
-      if (lines.length < 2) return;
-      lines.shift(); // remove header row
-      lines.forEach((line, step) => {
-        const parts = line.split("|").filter(p => p !== "");
-        // parts[0] is the step counter; then parts[1..] are track cells.
-        parts.slice(1).forEach((cell, tIndex) => {
-          const values = cell.split(",");
-          if (values.length === 5) {
-            const pat = tracksData[tIndex].patterns[currentPatternIndex];
-            pat.A[step] = values[0];
-            pat.B[step] = values[1];
-            pat.C[step] = values[2];
-            pat.D[step] = values[3];
-            pat.E[step] = values[4];
-          }
-        });
-      });
-      updateCsoundMatrix();
-    }
-    
-    /***************************************************
-     * Pattern Editor Input Handling
-     ***************************************************/
-    // Each track cell is assumed to occupy 15 characters:
-    // "00,00,00,00,00" (14 characters) plus the trailing divider.
-    // In each cell, only positions 0-1 (channel A), 3-4 (B), 6-7 (C), 9-10 (D), 12-13 (E) are editable.
-    // When you type a digit (or '^'), it overwrites the character at that position and the caret remains in that cell.
-    patternEditEl.addEventListener("keydown", function(e) {
-      if (e.ctrlKey && e.key.toLowerCase() === "e") { e.preventDefault(); compile(); return; }
-      if (e.key.length !== 1) return;
-      if (!/[0-9^]/.test(e.key)) { e.preventDefault(); return; }
-      
-      const caret = this.selectionStart;
-      const lines = this.value.split("\n");
-      let pos = 0, lineIndex = 0;
-      for (let i = 0; i < lines.length; i++) {
-        if (pos + lines[i].length + 1 > caret) { lineIndex = i; break; }
-        pos += lines[i].length + 1;
-      }
-      // Do not allow editing in header row.
-      if (lineIndex === 0) { e.preventDefault(); return; }
-      let col = caret - pos;
-      // The first 5 characters (e.g. "|000|") are non-editable.
-      if (col < 5) { e.preventDefault(); return; }
-      
-      // Each track cell occupies 15 characters.
-      let cellIndex = Math.floor((col - 5) / 15);
-      let cellStart = 5 + cellIndex * 15;
-      let offset = col - cellStart;
-      
-      // Allowed editable offsets: 0-1 (A), 3-4 (B), 6-7 (C), 9-10 (D), 12-13 (E)
-      let channel = null, digitIndex = null;
-      if (offset >= 0 && offset <= 1) { channel = "A"; digitIndex = offset; }
-      else if (offset >= 3 && offset <= 4) { channel = "B"; digitIndex = offset - 3; }
-      else if (offset >= 6 && offset <= 7) { channel = "C"; digitIndex = offset - 6; }
-      else if (offset >= 9 && offset <= 10) { channel = "D"; digitIndex = offset - 9; }
-      else if (offset >= 12 && offset <= 13) { channel = "E"; digitIndex = offset - 12; }
-      else { e.preventDefault(); return; }
-      
-      // Extract the step number from the row.
-      const line = lines[lineIndex];
-      const step = parseInt(line.slice(1,4));
-      if (isNaN(step)) { e.preventDefault(); return; }
-      
-      if (cellIndex < 0 || cellIndex >= tracksData.length) { e.preventDefault(); return; }
-      
-      const track = tracksData[cellIndex];
-      let currentVal = track.patterns[currentPatternIndex][channel][step];
-      if (currentVal.length < 2) { currentVal = (currentVal + "0").slice(0,2); }
-      let newValArr = currentVal.split('');
-      if (e.key === "^") { newValArr = ["^", "^"]; }
-      else { newValArr[digitIndex] = e.key; }
-      track.patterns[currentPatternIndex][channel][step] = newValArr.join('');
-      
-      e.preventDefault();
-      writePattern();
-      // Restore caret to the beginning of the cell's editable area.
-      patternEditEl.selectionStart = patternEditEl.selectionEnd = cellStart;
-    });
-    
-    /***************************************************
-     * Clock Worker and Playback
-     ***************************************************/
+    let clockWorker = null;
     function initClockWorker() {
       const workerCode = `
         let bpm = 120, currentStep = 0, running = false, nextTickTime = 0;
-        const stepsPerPattern = 512;
+        const stepsPerPattern = 256;
         function scheduleTick() {
           if (!running) return;
           const now = performance.now();
@@ -344,38 +224,123 @@
       const blob = new Blob([workerCode], { type: 'application/javascript' });
       const workerURL = URL.createObjectURL(blob);
       clockWorker = new Worker(workerURL);
-      clockWorker.onmessage = (e) => { if(e.data.type==='tick') updateStep(e.data.step); };
+      clockWorker.onmessage = (e) => {
+        if (e.data.type === 'tick') updateStep(e.data.step);
+      };
     }
     
+    /***************************************************
+     * Editor and Data Initialization
+     ***************************************************/
+    function initializeEditor() {
+      orchestraEl.value = updateCsoundOrc();
+      tracksData = [];
+      currentPatternIndex = 0;
+      currentStepJS = 0;
+      // Initialize 8 tracks.
+      for (let i = 1; i <= 8; i++) {
+        tracksData.push(generateTrack(i));
+      }
+      readPattern();
+      updateLoopRangeDefaults();
+    }
+    window.onload = () => {
+      initializeEditor();
+      initClockWorker();
+    };
+    
+    /***************************************************
+     * Global Shortcut (CTRL+E to Compile)
+     ***************************************************/
+    document.addEventListener("keydown", (e) => {
+      if (e.ctrlKey && e.key.toLowerCase() === "e") {
+        e.preventDefault();
+        compile();
+      }
+    });
+    
+    /***************************************************
+     * Csound Integration Functions
+     ***************************************************/
+    function moduleDidLoad() {
+      csound.Play();
+      compile();
+    }
+    function compile() {
+      csound.compileOrc(instrumentsEl.value);
+      csound.compileOrc(orchestraEl.value);
+    }
+    function updateCsoundOrc() {
+      let orcCode = "";
+      for (let i = 1; i <= 16; i++) {
+        orcCode += `instr ${i}\n  \nendin\n\n`;
+      }
+      orcCode += `instr 17\n gkstepinput chnget "stepvalue"\n  \nendin\n\n`;
+      return orcCode;
+    }
+    function updateCsoundMatrix() {
+      let csoundText = "";
+      tracksData.forEach((track, tIndex) => {
+        const pat = track.patterns[currentPatternIndex] || initializePattern();
+        channels.forEach((channel, cIndex) => {
+          let cells = [];
+          for (let i = 0; i < stepsPerPattern; i++) {
+            cells.push(pat[channel][i]);
+          }
+          let groups = [];
+          for (let i = 0; i < cells.length; i += 8) {
+            let group = cells.slice(i, i + 8).join(", ");
+            if (i + 8 < cells.length) { group += ",\\"; }
+            groups.push(group);
+          }
+          const ftNum = 99 + (tIndex * channels.length) + (cIndex + 1);
+          csoundText += `gitrk_${tIndex+1}_${channel} ftgen ${ftNum}, 0, 256, -2, \\\n` +
+                        groups.join("\n") + "\n\n";
+        });
+      });
+      instrumentsEl.value = csoundText;
+    }
+    
+    /***************************************************
+     * Console Logging Utility
+     ***************************************************/
+    function handleMessage(message) {
+      consoleEl.value += message;
+      const lines = consoleEl.value.split('\n');
+      if (lines.length > 64) { consoleEl.value = lines.slice(-16).join('\n'); }
+      consoleEl.scrollTop = consoleEl.scrollHeight;
+    }
+    
+    /***************************************************
+     * Playback and Clock Functions
+     ***************************************************/
     function updateStep(step) {
-      // When a full cycle is completed:
-      if (step === 0 && prevStep === 511) {
+      if (step === 0 && prevStep === 255) {
         if (document.getElementById("loopCheckbox").checked) {
           currentPatternIndex = (currentPatternIndex < loopEnd) ? currentPatternIndex + 1 : loopStart;
           readPattern();
         } else {
-          if (currentPatternIndex >= getTotalPatterns()-1) { stopCsound(); return; }
+          if (currentPatternIndex >= getTotalPatterns() - 1) { stopCsound(); return; }
           else { currentPatternIndex++; readPattern(); }
         }
       }
       prevStep = step;
       currentStepJS = step;
       csound.SetChannel("stepvalue", currentStepJS);
-      generateEventsForStep(currentStepJS);
-      const currentBeat = Math.floor(currentStepJS/16) + 1;
-      document.getElementById("patternCounter").textContent =
-        `Pattern: ${currentPatternIndex+1}/${getTotalPatterns()} | Beat: ${currentBeat} | BPM: ${currentBPM}`;
-      if(window.csound && typeof window.csound.setControlChannel === "function"){
+      csound.Event("i 17 0 1");
+      updatePatternCounter();
+      if (window.csound && typeof window.csound.setControlChannel === "function") {
         window.csound.setControlChannel("stepcount", currentStepJS);
       }
     }
-    
     function togglePlay() {
       compile();
       if (isPlaying) {
+        CsoundObj.CSOUND_AUDIO_CONTEXT.resume();
         stopCsound();
         document.getElementById("playToggle").textContent = "Play";
         isPlaying = false;
+        if (clockWorker) { clockWorker.postMessage({ type: "stop" }); }
       } else {
         currentBPM = bpmBuffer;
         document.getElementById("bpmSlider").value = currentBPM;
@@ -385,67 +350,233 @@
         if (clockWorker) { clockWorker.postMessage({ type: "start", bpm: currentBPM }); }
       }
     }
-    
     function playCsound() {
       writePattern();
       updateCsoundMatrix();
       readPattern();
     }
-    
     function stopCsound() {
       if (clockWorker) { clockWorker.postMessage({ type: "stop" }); }
+      updatePatternCounter();
       document.getElementById("playToggle").textContent = "Play";
       isPlaying = false;
     }
-    
     function updateBPM() {
       currentBPM = parseInt(document.getElementById("bpmSlider").value, 10);
       bpmBuffer = currentBPM;
-      if (clockWorker && isPlaying) { clockWorker.postMessage({ type: "updateBpm", bpm: currentBPM }); }
-      const currentBeat = Math.floor(currentStepJS/16)+1;
-      document.getElementById("patternCounter").textContent =
-        `Pattern: ${currentPatternIndex+1}/${getTotalPatterns()} | Beat: ${currentBeat} | BPM: ${currentBPM}`;
+      updatePatternCounter();
+      if (window.Csound && typeof window.Csound.setChannel === "function") {
+        window.Csound.setChannel("bpm", currentBPM);
+      }
+      if (clockWorker && isPlaying) {
+        clockWorker.postMessage({ type: "updateBpm", bpm: currentBPM });
+      }
     }
     
     /***************************************************
-     * Csound Event Generation
+     * Data Model Functions
      ***************************************************/
-    // Map channels:
-    // Channel A (first "00") is the note–length multiplier (p4)
-    // Channel B (second "00") is the instrument number
-    // Channels C, D, E become p5, p6, p7.
-    // Do not trigger an event if either A or B is "00".
-    function generateEventsForStep(stepIndex) {
-      tracksData.forEach((track, tIndex) => {
-        const pat = track.patterns[currentPatternIndex];
-        let A = pat.A[stepIndex];
-        let B = pat.B[stepIndex];
-        if (A === "00" || B === "00") return;
-        let C = pat.C[stepIndex];
-        let D = pat.D[stepIndex];
-        let E = pat.E[stepIndex];
-        let mult = (A === "^^" || isNaN(parseInt(A))) ? 1 : parseInt(A);
-        let noteLength = (mult * (60/currentBPM)).toFixed(3);
-        let eventStr = "i" + B + " 0 " + noteLength + " " + C + " " + D + " " + E;
-        csound.Event(eventStr);
-      });
+    function initializePattern() {
+      return {
+        A: new Array(stepsPerPattern).fill("00"),
+        B: new Array(stepsPerPattern).fill("00"),
+        C: new Array(stepsPerPattern).fill("00"),
+        D: new Array(stepsPerPattern).fill("00"),
+        E: new Array(stepsPerPattern).fill("00")
+      };
+    }
+    function deepCopyPattern(pattern) {
+      return {
+        A: [...pattern.A],
+        B: [...pattern.B],
+        C: [...pattern.C],
+        D: [...pattern.D],
+        E: [...pattern.E]
+      };
+    }
+    function generateTrack(id) {
+      return {
+        header: `######${id.toString().padStart(2, '0')}######`,
+        patterns: [initializePattern()]
+      };
+    }
+    function updatePatternCounter() {
+      const totalPatterns = getTotalPatterns();
+      const currentBeat = Math.floor(currentStepJS / 16) + 1;
+      document.getElementById("patternCounter").textContent =
+        `Pattern: ${currentPatternIndex + 1}/${totalPatterns} | Beat: ${currentBeat} | BPM: ${currentBPM}`;
+      const totalSteps = totalPatterns * stepsPerPattern;
+      const absoluteStep = currentPatternIndex * stepsPerPattern + currentStepJS;
+      const slider = document.getElementById("patternSlider");
+      if (slider) {
+        slider.min = 0;
+        slider.max = totalSteps - 1;
+        if (parseInt(slider.value, 10) !== absoluteStep) { slider.value = absoluteStep; }
+      }
+      document.getElementById("loopStart").max = totalPatterns;
+      document.getElementById("loopEnd").max = totalPatterns;
     }
     
     /***************************************************
-     * Pattern and Track Navigation & File I/O
+     * Pattern Editor – Grid Rendering and Editing
+     ***************************************************/
+    // The header row is rendered as:
+    // |***|######01######|######02######| ... |######08######|
+    // Each data row begins with the step counter (e.g. |000|) and then one cell per track,
+    // where each cell is rendered as "00,00,00,00,00".
+    function readPattern() {
+      if (tracksData.length === 0) {
+        patternEditEl.value = "";
+        updatePatternCounter();
+        return;
+      }
+      let headerLine = "|***|";
+      tracksData.forEach(track => { headerLine += track.header + "|"; });
+      headerLine += "\n";
+      
+      let textOutput = headerLine;
+      for (let step = 0; step < stepsPerPattern; step++) {
+        let line = "|" + step.toString().padStart(3, '0') + "|";
+        tracksData.forEach(track => {
+          const pat = track.patterns[currentPatternIndex] || initializePattern();
+          let cell = [pat.A[step], pat.B[step], pat.C[step], pat.D[step], pat.E[step]].join(",");
+          line += cell + "|";
+        });
+        textOutput += line + "\n";
+      }
+      patternEditEl.value = textOutput;
+      updateCsoundMatrix();
+      updatePatternCounter();
+    }
+    
+    // Parses the grid back into the model.
+    function writePattern() {
+      if (tracksData.length === 0) return;
+      const lines = patternEditEl.value.split("\n").filter(line => line.trim() !== "");
+      if (lines.length < 2) return;
+      lines.shift(); // Remove header row.
+      lines.forEach((line, step) => {
+        const parts = line.split("|").filter(p => p !== "");
+        parts.slice(1).forEach((cell, tIndex) => {
+          const values = cell.split(",");
+          if (values.length === 5) {
+            const pat = tracksData[tIndex].patterns[currentPatternIndex];
+            pat.A[step] = values[0];
+            pat.B[step] = values[1];
+            pat.C[step] = values[2];
+            pat.D[step] = values[3];
+            pat.E[step] = values[4];
+          }
+        });
+      });
+      updateCsoundMatrix();
+    }
+    
+    // Keydown handler: Only numeric keys are allowed within editable positions.
+    // The special divider characters (|, commas, asterisks) are non-editable.
+    // With "insert mode" behavior, the digit typed overwrites the character at the current caret.
+    // The caret remains unchanged.
+    patternEditEl.addEventListener("keydown", function(e) {
+      if (e.ctrlKey && e.key.toLowerCase() === "e") {
+        e.preventDefault();
+        compile();
+        return;
+      }
+      if (e.key.length !== 1) return;
+      if (!/[0-9]/.test(e.key)) { e.preventDefault(); return; }
+      
+      const caret = this.selectionStart;
+      const lines = this.value.split("\n");
+      let pos = 0, lineIndex = 0;
+      for (let i = 0; i < lines.length; i++) {
+        if (pos + lines[i].length + 1 > caret) { lineIndex = i; break; }
+        pos += lines[i].length + 1;
+      }
+      // Do not allow editing in header row.
+      if (lineIndex === 0) { e.preventDefault(); return; }
+      let col = caret - pos;
+      // First 5 characters (e.g. "|000|") are non‑editable.
+      if (col < 5) { e.preventDefault(); return; }
+      
+      // IMPORTANT: Each track cell occupies 15 characters in the rendered text
+      // (14 characters for "00,00,00,00,00" plus 1 for the divider).
+      let cellIndex = Math.floor((col - 5) / 15);
+      let cellStart = 5 + cellIndex * 15;
+      let offset = col - cellStart;
+      
+      // Allowed editable offsets within the cell:
+      // 0-1 for channel A, 3-4 for channel B, 6-7 for channel C, 9-10 for channel D, 12-13 for channel E.
+      let channel = null, digitIndex = null;
+      if (offset >= 0 && offset <= 1) { channel = "A"; digitIndex = offset; }
+      else if (offset >= 3 && offset <= 4) { channel = "B"; digitIndex = offset - 3; }
+      else if (offset >= 6 && offset <= 7) { channel = "C"; digitIndex = offset - 6; }
+      else if (offset >= 9 && offset <= 10) { channel = "D"; digitIndex = offset - 9; }
+      else if (offset >= 12 && offset <= 13) { channel = "E"; digitIndex = offset - 12; }
+      else { e.preventDefault(); return; }
+      
+      const step = lineIndex - 1;
+      if (cellIndex < 0 || cellIndex >= tracksData.length) { e.preventDefault(); return; }
+      
+      const track = tracksData[cellIndex];
+      let currentVal = track.patterns[currentPatternIndex][channel][step];
+      if (currentVal.length < 2) { currentVal = (currentVal + "0").slice(0,2); }
+      let newValArr = currentVal.split('');
+      newValArr[digitIndex] = e.key;
+      track.patterns[currentPatternIndex][channel][step] = newValArr.join('');
+      
+      e.preventDefault();
+      const oldCaret = caret;
+      readPattern();
+      // Restore the caret exactly where it was.
+      patternEditEl.selectionStart = patternEditEl.selectionEnd = oldCaret;
+    });
+    
+    /***************************************************
+     * Loop Range Controls
+     ***************************************************/
+    function validateLoopRange() {
+      const total = getTotalPatterns();
+      let ls = parseInt(document.getElementById("loopStart").value, 10);
+      let le = parseInt(document.getElementById("loopEnd").value, 10);
+      if (isNaN(ls) || ls < 1) ls = 1;
+      if (isNaN(le) || le < 1) le = 1;
+      if (ls > total) ls = total;
+      if (le > total) le = total;
+      if (ls > le) ls = le;
+      document.getElementById("loopStart").value = ls;
+      document.getElementById("loopEnd").value = le;
+      loopStart = ls - 1;
+      loopEnd = le - 1;
+    }
+    function updateLoopRangeDefaults() {
+      const total = getTotalPatterns();
+      document.getElementById("loopStart").value = 1;
+      document.getElementById("loopEnd").value = total;
+      loopStart = 0;
+      loopEnd = total - 1;
+    }
+    
+    /***************************************************
+     * Pattern and Track Navigation
      ***************************************************/
     function previousPattern() {
       writePattern();
-      if (currentPatternIndex > 0) { currentPatternIndex--; readPattern(); }
-      else { alert("Already at the first pattern."); }
+      if (currentPatternIndex > 0) {
+        currentPatternIndex--;
+        readPattern();
+      } else {
+        alert("Already at the first pattern.");
+      }
     }
-    
     function nextPattern() {
       writePattern();
-      if (currentPatternIndex < tracksData[0].patterns.length - 1) { currentPatternIndex++; readPattern(); }
-      else { alert("Already at the last pattern."); }
+      if (currentPatternIndex < tracksData[0].patterns.length - 1) {
+        currentPatternIndex++;
+        readPattern();
+      } else {
+        alert("Already at the last pattern.");
+      }
     }
-    
     function copyPattern() {
       writePattern();
       tracksData.forEach(track => {
@@ -456,20 +587,29 @@
       readPattern();
     }
     
+    /***************************************************
+     * Copy and Paste Functions
+     ***************************************************/
     function copyToBuffer() {
       writePattern();
       patternBuffer = [];
-      tracksData.forEach(track => { patternBuffer.push(deepCopyPattern(track.patterns[currentPatternIndex])); });
+      tracksData.forEach(track => {
+        patternBuffer.push(deepCopyPattern(track.patterns[currentPatternIndex]));
+      });
       alert("Pattern copied to buffer.");
     }
-    
     function pasteFromBuffer() {
       if (!patternBuffer) { alert("Buffer is empty."); return; }
       writePattern();
-      tracksData.forEach((track, tIndex) => { track.patterns[currentPatternIndex] = deepCopyPattern(patternBuffer[tIndex]); });
+      tracksData.forEach((track, tIndex) => {
+        track.patterns[currentPatternIndex] = deepCopyPattern(patternBuffer[tIndex]);
+      });
       readPattern();
     }
     
+    /***************************************************
+     * Data Persistence Functions
+     ***************************************************/
     function savePatternData() {
       writePattern();
       const numTracks = tracksData.length;
@@ -481,7 +621,9 @@
       let trackStream = "";
       tracksData.forEach(track => {
         track.patterns.forEach(pattern => {
-          channels.forEach(key => { pattern[key].forEach(val => { trackStream += val; }); });
+          channels.forEach(key => {
+            pattern[key].forEach(val => { trackStream += val; });
+          });
         });
       });
       const orchestraData = orchestraEl.value;
@@ -489,7 +631,9 @@
       header += String(orchestraLength).padStart(5, '0');
       const fullStream = header + trackStream + orchestraData;
       const buffer = new Uint8Array(fullStream.length);
-      for (let i = 0; i < fullStream.length; i++) { buffer[i] = fullStream.charCodeAt(i); }
+      for (let i = 0; i < fullStream.length; i++) {
+        buffer[i] = fullStream.charCodeAt(i);
+      }
       const blob = new Blob([buffer], { type: "application/octet-stream" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -498,7 +642,6 @@
       a.click();
       URL.revokeObjectURL(url);
     }
-    
     function loadPatternData(event) {
       const file = event.target.files[0];
       if (!file) return;
@@ -537,16 +680,25 @@
           }
           currentPatternIndex = 0;
           readPattern();
+          updateLoopRangeDefaults();
           orchestraEl.value = orchestraData;
           compile();
-        } catch (err) { console.error("Error loading pattern data:", err); }
+        } catch (err) {
+          console.error("Error loading pattern data:", err);
+        }
       };
       reader.readAsArrayBuffer(file);
     }
     
+    /***************************************************
+     * Example Song Loader Function
+     ***************************************************/
     function loadExampleSong(filename) {
       fetch(filename)
-        .then(response => { if (!response.ok) { throw new Error("File not found"); } return response.arrayBuffer(); })
+        .then(response => {
+          if (!response.ok) { throw new Error("File not found"); }
+          return response.arrayBuffer();
+        })
         .then(buffer => {
           const uint8 = new Uint8Array(buffer);
           let fullStream = "";
@@ -580,30 +732,34 @@
           }
           currentPatternIndex = 0;
           readPattern();
+          updateLoopRangeDefaults();
           orchestraEl.value = orchestraData;
           compile();
         })
-        .catch(err => { alert("There are no songs here, sorry."); console.error("Error loading example song:", err); });
+        .catch(err => {
+          alert("There are no songs here, sorry.");
+          console.error("Error loading example song:", err);
+        });
     }
     
+    /***************************************************
+     * Song Initialization Function
+     ***************************************************/
     function songInit() {
       if (confirm("This will delete all pattern and Csound data and reinitialize the song. Proceed?")) {
         tracksData = [];
         currentPatternIndex = 0;
         currentStepJS = 0;
         if (clockWorker) { clockWorker.postMessage({ type: "stop" }); }
-        for (let i = 1; i <= 8; i++) { tracksData.push(generateTrack(i)); }
+        for (let i = 1; i <= 8; i++) {
+          tracksData.push(generateTrack(i));
+        }
+        updateLoopRangeDefaults();
         orchestraEl.value = updateCsoundOrc();
         readPattern();
         compile();
       }
     }
-    
-    // Initialize editor and clock worker on page load.
-    window.onload = function() {
-      initializeEditor();
-      initClockWorker();
-    };
   </script>
 </body>
 </html>
