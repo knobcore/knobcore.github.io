@@ -103,13 +103,19 @@ endin`,
 endin`
 ];
 
-// Piano keyboard mapping
+// Piano keyboard mapping (z=C-4, ]=G)
+// Lower row: z-/ = C to E (with black keys s,d,g,h,j)
+// Upper row: q-] = C+1oct to G+2oct (with black keys 2,3,5,6,7,9,0,=)
 var keyboardMap = {
+    // Lower octave (z row)
     'z': 0,  's': 1,  'x': 2,  'd': 3,  'c': 4,  'v': 5,
     'g': 6,  'b': 7,  'h': 8,  'n': 9,  'j': 10, 'm': 11,
+    ',': 12, 'l': 13, '.': 14, ';': 15, '/': 16,
+    // Upper octave (q row)
     'q': 12, '2': 13, 'w': 14, '3': 15, 'e': 16, 'r': 17,
     '5': 18, 't': 19, '6': 20, 'y': 21, '7': 22, 'u': 23,
-    'i': 24, '9': 25, 'o': 26, '0': 27, 'p': 28
+    'i': 24, '9': 25, 'o': 26, '0': 27, 'p': 28, '-': 29,
+    '[': 30, '=': 31, ']': 31
 };
 
 var noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
@@ -195,15 +201,18 @@ var clipboard = {
     height: 0
 };
 
-// Selection state
+// Selection state - uses absolute column index for simple rectangular selection
 var selection = {
     active: false,
     startTrack: -1,
     startStep: -1,
-    startCol: -1,
-    startType: null,
+    startAbsCol: -1,  // Absolute column index (0 = note0, 1 = amp0, 2 = note1, 3 = amp1, ... then fx columns)
     endTrack: -1,
     endStep: -1,
+    endAbsCol: -1,
+    // Keep type/col for compatibility
+    startCol: -1,
+    startType: null,
     endCol: -1,
     endType: null
 };
@@ -776,15 +785,19 @@ function onGridMouseDown(e) {
     dragState.startX = e.clientX;
     dragState.startY = e.clientY;
 
+    var absCol = toAbsoluteCol(info.track, info.type, info.col);
+
     selection.active = true;
     selection.startTrack = info.track;
     selection.startStep = info.step;
     selection.startCol = info.col;
     selection.startType = info.type;
+    selection.startAbsCol = absCol;
     selection.endTrack = info.track;
     selection.endStep = info.step;
     selection.endCol = info.col;
     selection.endType = info.type;
+    selection.endAbsCol = absCol;
 
     state.focusedTrack = info.track;
     state.focusedStep = info.step;
@@ -822,24 +835,19 @@ function onDocumentMouseMove(e) {
     var info = getCellInfo(cell);
     if (!info) return;
 
+    var absCol = toAbsoluteCol(info.track, info.type, info.col);
+
     // Track if anything changed
     var changed = false;
 
-    // Always update step and track
-    if (selection.endTrack !== info.track || selection.endStep !== info.step) {
+    // Update track, step, and column for rectangular selection
+    if (selection.endTrack !== info.track || selection.endStep !== info.step || selection.endAbsCol !== absCol) {
         selection.endTrack = info.track;
         selection.endStep = info.step;
+        selection.endCol = info.col;
+        selection.endType = info.type;
+        selection.endAbsCol = absCol;
         changed = true;
-    }
-
-    // Only update column selection if still within the SAME track
-    // This allows flexible column selection within a track, but locks it when crossing tracks
-    if (info.track === selection.startTrack) {
-        if (selection.endType !== info.type || selection.endCol !== info.col) {
-            selection.endType = info.type;
-            selection.endCol = info.col;
-            changed = true;
-        }
     }
 
     if (changed) {
@@ -1165,6 +1173,39 @@ function getTypeOrder(type) {
     return 0;
 }
 
+// Convert (type, col) to absolute column index for a track
+// Layout: note0, amp0, note1, amp1, ..., fx0, fx1, ...
+function toAbsoluteCol(track, type, col) {
+    var noteColumns = state.tracks[track].noteColumns;
+    if (type === 'note') {
+        return col * 2;
+    } else if (type === 'amp') {
+        return col * 2 + 1;
+    } else if (type === 'fx') {
+        return noteColumns * 2 + col;
+    }
+    return 0;
+}
+
+// Convert absolute column index to (type, col) for a track
+function fromAbsoluteCol(track, absCol) {
+    var noteColumns = state.tracks[track].noteColumns;
+    var noteAmpCols = noteColumns * 2;
+
+    if (absCol < noteAmpCols) {
+        var noteIdx = Math.floor(absCol / 2);
+        var isAmp = absCol % 2 === 1;
+        return { type: isAmp ? 'amp' : 'note', col: noteIdx };
+    } else {
+        return { type: 'fx', col: absCol - noteAmpCols };
+    }
+}
+
+// Get total number of columns in a track
+function getTotalColumns(track) {
+    return state.tracks[track].noteColumns * 2 + state.tracks[track].fxColumns;
+}
+
 function highlightSelection() {
     // Clear old highlights
     for (var i = 0; i < selectedCells.length; i++) {
@@ -1174,148 +1215,88 @@ function highlightSelection() {
 
     if (!selection.active) return;
 
+    var container = patternGridCache[currentGridPatternIndex];
+    if (!container) return;
+
     var minStep = Math.min(selection.startStep, selection.endStep);
     var maxStep = Math.max(selection.startStep, selection.endStep);
     var minTrack = Math.min(selection.startTrack, selection.endTrack);
     var maxTrack = Math.max(selection.startTrack, selection.endTrack);
+    var minAbsCol = Math.min(selection.startAbsCol, selection.endAbsCol);
+    var maxAbsCol = Math.max(selection.startAbsCol, selection.endAbsCol);
 
-    var container = patternGridCache[currentGridPatternIndex];
-    if (!container) return;
+    // Simple rectangular selection: iterate over all cells in the rectangle
+    for (var step = minStep; step <= maxStep; step++) {
+        for (var track = minTrack; track <= maxTrack; track++) {
+            var totalCols = getTotalColumns(track);
+            var colStart = (track === minTrack) ? minAbsCol : 0;
+            var colEnd = (track === maxTrack) ? maxAbsCol : (totalCols - 1);
 
-    // Check if this is a single cell selection (no drag, same position)
-    var isSingleCell = (selection.startStep === selection.endStep &&
-                        selection.startTrack === selection.endTrack &&
-                        selection.startType === selection.endType &&
-                        selection.startCol === selection.endCol);
-
-    if (isSingleCell) {
-        // Single cell: only select that specific cell
-        var cell = container.querySelector(
-            '.cell[data-track="' + minTrack + '"][data-step="' + minStep + '"][data-col="' + selection.startCol + '"][data-type="' + selection.startType + '"]'
-        );
-        if (cell) {
-            cell.classList.add('selected');
-            selectedCells.push(cell);
-        }
-    } else {
-        // Range selection: select cells based on type and column ranges
-        var startTypeOrder = getTypeOrder(selection.startType);
-        var endTypeOrder = getTypeOrder(selection.endType);
-        var minTypeOrder = Math.min(startTypeOrder, endTypeOrder);
-        var maxTypeOrder = Math.max(startTypeOrder, endTypeOrder);
-
-        // Determine column ranges for note/amp (they share col indices) and fx
-        var noteAmpMinCol, noteAmpMaxCol, fxMinCol, fxMaxCol;
-        var selectNotes = false, selectAmps = false, selectFx = false;
-
-        // Check which types are in range
-        if (minTypeOrder <= 0 && maxTypeOrder >= 0) selectNotes = true;
-        if (minTypeOrder <= 1 && maxTypeOrder >= 1) selectAmps = true;
-        if (minTypeOrder <= 2 && maxTypeOrder >= 2) selectFx = true;
-
-        // Calculate column ranges based on what's selected
-        if (selection.startType === 'fx' && selection.endType === 'fx') {
-            // Only fx columns
-            fxMinCol = Math.min(selection.startCol, selection.endCol);
-            fxMaxCol = Math.max(selection.startCol, selection.endCol);
-            noteAmpMinCol = noteAmpMaxCol = -1;
-        } else if (selection.startType !== 'fx' && selection.endType !== 'fx') {
-            // Only note/amp columns
-            noteAmpMinCol = Math.min(selection.startCol, selection.endCol);
-            noteAmpMaxCol = Math.max(selection.startCol, selection.endCol);
-            fxMinCol = fxMaxCol = -1;
-        } else {
-            // Mixed: crossing from note/amp to fx or vice versa
-            // Select the specific columns on each side
-            if (selection.startType === 'fx') {
-                fxMinCol = 0;
-                fxMaxCol = selection.startCol;
-                noteAmpMinCol = selection.endCol;
-                noteAmpMaxCol = 99; // Will be clamped by actual track columns
-            } else {
-                noteAmpMinCol = selection.startCol;
-                noteAmpMaxCol = 99; // Will be clamped by actual track columns
-                fxMinCol = 0;
-                fxMaxCol = selection.endCol;
+            // For single-track selection, use exact column range
+            // For multi-track, select from start col to end of first track,
+            // all cols for middle tracks, start to end col for last track
+            if (minTrack === maxTrack) {
+                colStart = minAbsCol;
+                colEnd = maxAbsCol;
             }
-        }
 
-        // Check if selecting across multiple tracks
-        var isMultiTrack = (minTrack !== maxTrack);
-
-        for (var step = minStep; step <= maxStep; step++) {
-            for (var track = minTrack; track <= maxTrack; track++) {
-                var trackNoteColumns = state.tracks[track].noteColumns;
-                var trackFxColumns = state.tracks[track].fxColumns;
-
-                // Select note cells
-                if (selectNotes) {
-                    // Multi-track: select ALL note columns in each track
-                    // Single track: use the specific column range
-                    var actualNoteMin = isMultiTrack ? 0 : Math.max(0, noteAmpMinCol);
-                    var actualNoteMax = isMultiTrack ? (trackNoteColumns - 1) : Math.min(trackNoteColumns - 1, noteAmpMaxCol);
-                    for (var col = actualNoteMin; col <= actualNoteMax; col++) {
-                        var cell = container.querySelector(
-                            '.cell[data-track="' + track + '"][data-step="' + step + '"][data-col="' + col + '"][data-type="note"]'
-                        );
-                        if (cell) {
-                            cell.classList.add('selected');
-                            selectedCells.push(cell);
-                        }
-                    }
-                }
-
-                // Select amp cells
-                if (selectAmps) {
-                    var actualAmpMin = isMultiTrack ? 0 : Math.max(0, noteAmpMinCol);
-                    var actualAmpMax = isMultiTrack ? (trackNoteColumns - 1) : Math.min(trackNoteColumns - 1, noteAmpMaxCol);
-                    for (var col = actualAmpMin; col <= actualAmpMax; col++) {
-                        var cell = container.querySelector(
-                            '.cell[data-track="' + track + '"][data-step="' + step + '"][data-col="' + col + '"][data-type="amp"]'
-                        );
-                        if (cell) {
-                            cell.classList.add('selected');
-                            selectedCells.push(cell);
-                        }
-                    }
-                }
-
-                // Select fx cells
-                if (selectFx) {
-                    var actualFxMin = isMultiTrack ? 0 : Math.max(0, fxMinCol);
-                    var actualFxMax = isMultiTrack ? (trackFxColumns - 1) : Math.min(trackFxColumns - 1, fxMaxCol);
-                    for (var col = actualFxMin; col <= actualFxMax; col++) {
-                        var cell = container.querySelector(
-                            '.cell[data-track="' + track + '"][data-step="' + step + '"][data-col="' + col + '"][data-type="fx"]'
-                        );
-                        if (cell) {
-                            cell.classList.add('selected');
-                            selectedCells.push(cell);
-                        }
-                    }
+            for (var absCol = colStart; absCol <= colEnd && absCol < totalCols; absCol++) {
+                var colInfo = fromAbsoluteCol(track, absCol);
+                var cell = container.querySelector(
+                    '.cell[data-track="' + track + '"][data-step="' + step + '"][data-col="' + colInfo.col + '"][data-type="' + colInfo.type + '"]'
+                );
+                if (cell) {
+                    cell.classList.add('selected');
+                    selectedCells.push(cell);
                 }
             }
         }
     }
 }
 
-function navigateSelection(trackDelta, stepDelta) {
+function navigateSelection(colDelta, stepDelta) {
     if (!selection.active) return;
 
-    var newTrack = selection.startTrack + trackDelta;
-    var newStep = selection.startStep + stepDelta;
     var pattern = getCurrentPattern();
+    var track = selection.startTrack;
+    var absCol = selection.startAbsCol + colDelta;
+    var step = selection.startStep + stepDelta;
 
-    if (newTrack < 0 || newTrack >= 16) return;
-    if (newStep < 0 || newStep >= pattern.steps) return;
+    // Handle column overflow to next/previous track
+    while (absCol < 0 && track > 0) {
+        track--;
+        absCol = getTotalColumns(track) + absCol;
+    }
+    while (absCol >= getTotalColumns(track) && track < 15) {
+        absCol = absCol - getTotalColumns(track);
+        track++;
+    }
 
-    selection.startTrack = newTrack;
-    selection.startStep = newStep;
-    selection.endTrack = newTrack;
-    selection.endStep = newStep;
+    // Clamp to valid range
+    if (track < 0 || track >= 16) return;
+    if (absCol < 0) absCol = 0;
+    if (absCol >= getTotalColumns(track)) absCol = getTotalColumns(track) - 1;
+    if (step < 0 || step >= pattern.steps) return;
 
-    state.focusedTrack = newTrack;
-    state.focusedStep = newStep;
+    // Update selection
+    selection.startTrack = track;
+    selection.startStep = step;
+    selection.startAbsCol = absCol;
+    selection.endTrack = track;
+    selection.endStep = step;
+    selection.endAbsCol = absCol;
+
+    // Update type/col for compatibility
+    var colInfo = fromAbsoluteCol(track, absCol);
+    selection.startType = colInfo.type;
+    selection.startCol = colInfo.col;
+    selection.endType = colInfo.type;
+    selection.endCol = colInfo.col;
+
+    state.focusedTrack = track;
+    state.focusedStep = step;
+    state.focusedColumn = colInfo.col;
+    state.focusedType = colInfo.type;
 
     highlightSelection();
 
@@ -1329,15 +1310,19 @@ function selectCell(cell) {
     var info = getCellInfo(cell);
     if (!info) return;
 
+    var absCol = toAbsoluteCol(info.track, info.type, info.col);
+
     selection.active = true;
     selection.startTrack = info.track;
     selection.startStep = info.step;
     selection.startCol = info.col;
     selection.startType = info.type;
+    selection.startAbsCol = absCol;
     selection.endTrack = info.track;
     selection.endStep = info.step;
     selection.endCol = info.col;
     selection.endType = info.type;
+    selection.endAbsCol = absCol;
 
     state.focusedTrack = info.track;
     state.focusedStep = info.step;
@@ -4906,7 +4891,7 @@ function init() {
     document.getElementById('code-editor').addEventListener('blur', saveCurrentInstrument);
     document.getElementById('opcodes-editor').addEventListener('blur', saveOpcodes);
 
-    consoleLog('Keys: z-m/q-u=notes, Tab=OFF, `=rec, Ctrl+C/X/V=copy/cut/paste');
+    consoleLog('Keys: z-]/q-]=notes, Arrows=nav, Tab=OFF, `=rec, Ctrl+C/X/V=copy/cut/paste');
 
     // Initialize Csound 7
     initCsound();
