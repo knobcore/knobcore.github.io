@@ -2692,7 +2692,7 @@ async function initCsound() {
 
     try {
         // Dynamic import of Csound 7
-        const { Csound } = await import('./csound.js');
+        const { Csound } = await import('./meow/csound.js');
 
         // Create Csound instance
         csound = await Csound({ useWorker: false });
