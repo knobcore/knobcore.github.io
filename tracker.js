@@ -2692,7 +2692,7 @@ async function initCsound() {
 
     try {
         // Dynamic import of Csound 7
-        const { Csound } = await import('./node_modules/@csound/browser/dist/csound.js');
+        const { Csound } = await import('csound.js');
 
         // Create Csound instance
         csound = await Csound({ useWorker: false });
