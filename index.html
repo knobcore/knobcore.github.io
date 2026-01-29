@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Csound Mod Tracker</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div id="app">
+        <header>
+            <div class="header-top">
+                <div class="file-controls">
+                    <button id="btn-save" title="Save Song (Ctrl+S)">Save</button>
+                    <button id="btn-load" title="Load Song (Ctrl+O)">Load</button>
+                    <button id="btn-export-csd" title="Export as Csound CSD">Export CSD</button>
+                    <input type="file" id="file-input" accept=".cst" style="display:none">
+                </div>
+                <div class="demo-controls">
+                    <span class="demo-label">Demos:</span>
+                    <button class="demo-btn" data-demo="1">1</button>
+                    <button class="demo-btn" data-demo="2">2</button>
+                    <button class="demo-btn" data-demo="3">3</button>
+                    <button class="demo-btn" data-demo="4">4</button>
+                </div>
+            </div>
+            <div class="transport-controls">
+                <button id="btn-play" disabled title="Play (Space)">&#9658;</button>
+                <button id="btn-stop" disabled title="Stop (Space)">&#9632;</button>
+                <button id="btn-record" title="Record (`)">&#9679; REC</button>
+                <div class="separator"></div>
+                <label>
+                    BPM: <input type="number" id="bpm" value="120" min="20" max="300">
+                </label>
+                <label>
+                    LPB: <input type="number" id="lpb" value="4" min="1" max="32" title="Lines Per Beat">
+                </label>
+                <label>
+                    Edit Step: <input type="number" id="edit-step" value="1" min="0" max="16" title="Cursor movement after note entry">
+                </label>
+                <label>
+                    Octave: <span id="octave-display">3</span>
+                </label>
+                <div class="separator"></div>
+                <label>
+                    Steps: <input type="number" id="step-count" value="64" min="1" max="999">
+                </label>
+                <button id="btn-apply-steps">Apply</button>
+            </div>
+        </header>
+
+        <div class="main-container">
+            <!-- Pattern Sequence Sidebar -->
+            <div class="sequence-sidebar">
+                <div class="sequence-header">
+                    <span>Sequence</span>
+                    <div class="sequence-buttons">
+                        <button id="btn-add-pattern" title="Add Pattern">+</button>
+                        <button id="btn-clone-pattern" title="Clone Pattern">C</button>
+                        <button id="btn-del-pattern" title="Delete Pattern">-</button>
+                    </div>
+                </div>
+                <div id="sequence-list"></div>
+                <div class="pattern-pool">
+                    <div class="pool-header">Patterns</div>
+                    <div id="pattern-pool-list"></div>
+                </div>
+            </div>
+
+            <!-- Tracker Grid -->
+            <div class="tracker-container">
+                <div id="tracker-grid"></div>
+            </div>
+
+            <!-- Code Editor Panel -->
+            <div class="editor-container">
+                <div class="editor-header">
+                    <span>Csound Code</span>
+                    <span class="shortcut-hint">(Alt+Space to compile)</span>
+                    <button id="btn-compile">Compile</button>
+                </div>
+
+                <!-- Main Tabs -->
+                <div class="main-tabs">
+                    <button class="main-tab active" data-tab="instruments">Instruments</button>
+                    <button class="main-tab" data-tab="opcodes">Opcodes</button>
+                    <button class="main-tab" data-tab="samples">Sample Import</button>
+                </div>
+
+                <!-- Instruments Tab Content -->
+                <div class="tab-content" id="tab-instruments">
+                    <div class="instrument-tabs" id="instrument-tabs"></div>
+                    <textarea id="code-editor" spellcheck="false"></textarea>
+                </div>
+
+                <!-- Opcodes Tab Content -->
+                <div class="tab-content hidden" id="tab-opcodes">
+                    <div class="opcodes-info">User Defined Opcodes (UDOs)</div>
+                    <textarea id="opcodes-editor" spellcheck="false" placeholder="; Define your custom opcodes here
+; Example:
+; opcode MyOscil, a, kk
+;   kfreq, kamp xin
+;   aout oscil kamp, kfreq
+;   xout aout
+; endop"></textarea>
+                </div>
+
+                <!-- Sample Import Tab Content -->
+                <div class="tab-content hidden" id="tab-samples">
+                    <div class="sample-controls">
+                        <label>
+                            Table #: <input type="number" id="sample-table-num" value="100" min="0" max="300">
+                        </label>
+                        <button id="btn-load-sample">Load Sample</button>
+                        <input type="file" id="sample-file-input" accept=".wav,.aif,.aiff,.mp3,.ogg" style="display:none">
+                    </div>
+                    <div class="sample-list-header">Loaded Samples:</div>
+                    <div id="sample-list"></div>
+                    <div class="sample-info">
+                        <p>Samples are loaded into Csound ftables.</p>
+                        <p>Use in instruments: <code>asig loscil 1, ifreq, itable</code></p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="console-container">
+            <div id="console-header">
+                <span>Csound Console</span>
+                <span class="keyboard-hint">Keys: z-m/q-u=notes, +/-=octave, `=record, Tab=OFF, Space=play, Ctrl+C/X/V=copy/cut/paste, Drag=select</span>
+                <button id="btn-toggle-console" title="Toggle Console">Show</button>
+            </div>
+            <div id="console" style="display:none"></div>
+        </div>
+
+        <div id="status-bar">Initializing...</div>
+    </div>
+
+    <!-- Load tracker as ES module -->
+    <script type="module" src="tracker.js"></script>
+</body>
+</html>
