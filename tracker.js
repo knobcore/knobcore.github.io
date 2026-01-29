@@ -757,6 +757,9 @@ function attachGridEvents(grid) {
     // Mouse events for selection
     grid.addEventListener('mousedown', onGridMouseDown);
 
+    // Right-click context menu
+    grid.addEventListener('contextmenu', onGridContextMenu);
+
     // Click for buttons
     grid.addEventListener('click', onGridClick);
 
@@ -766,6 +769,30 @@ function attachGridEvents(grid) {
     // Global keyboard
     document.addEventListener('keydown', onDocumentKeyDown);
     document.addEventListener('keyup', onDocumentKeyUp);
+}
+
+function onGridContextMenu(e) {
+    e.preventDefault();
+
+    var cell = findCell(e.target);
+    if (cell) {
+        // If clicking on a cell not in selection, select it first
+        var info = getCellInfo(cell);
+        if (info) {
+            var isInSelection = false;
+            for (var i = 0; i < selectedCells.length; i++) {
+                if (selectedCells[i] === cell) {
+                    isInSelection = true;
+                    break;
+                }
+            }
+            if (!isInSelection) {
+                selectCell(cell);
+            }
+        }
+    }
+
+    showContextMenu(e.clientX, e.clientY);
 }
 
 function onGridMouseDown(e) {
@@ -995,6 +1022,28 @@ function onDocumentKeyDown(e) {
         return;
     }
 
+    // Arrow navigation - always works (will create selection if needed)
+    if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        navigateSelection(0, 1);
+        return;
+    }
+    if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        navigateSelection(0, -1);
+        return;
+    }
+    if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        navigateSelection(1, 0);
+        return;
+    }
+    if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        navigateSelection(-1, 0);
+        return;
+    }
+
     // Selection-based shortcuts
     if (selection.active && selectedCells.length > 0) {
         // Ctrl+C - copy
@@ -1022,28 +1071,6 @@ function onDocumentKeyDown(e) {
         if (e.key === 'Delete' || e.key === 'Backspace') {
             e.preventDefault();
             clearSelectionData();
-            return;
-        }
-
-        // Arrow navigation
-        if (e.key === 'ArrowDown') {
-            e.preventDefault();
-            navigateSelection(0, 1);
-            return;
-        }
-        if (e.key === 'ArrowUp') {
-            e.preventDefault();
-            navigateSelection(0, -1);
-            return;
-        }
-        if (e.key === 'ArrowRight') {
-            e.preventDefault();
-            navigateSelection(1, 0);
-            return;
-        }
-        if (e.key === 'ArrowLeft') {
-            e.preventDefault();
-            navigateSelection(-1, 0);
             return;
         }
 
@@ -1255,9 +1282,30 @@ function highlightSelection() {
 }
 
 function navigateSelection(colDelta, stepDelta) {
-    if (!selection.active) return;
-
     var pattern = getCurrentPattern();
+    if (!pattern) return;
+
+    // If no active selection, create one at current focused position or (0,0,0)
+    if (!selection.active || selection.startAbsCol < 0) {
+        var track = state.focusedTrack >= 0 ? state.focusedTrack : 0;
+        var step = state.focusedStep >= 0 ? state.focusedStep : 0;
+        var type = state.focusedType || 'note';
+        var col = state.focusedColumn >= 0 ? state.focusedColumn : 0;
+        var absCol = toAbsoluteCol(track, type, col);
+
+        selection.active = true;
+        selection.startTrack = track;
+        selection.startStep = step;
+        selection.startAbsCol = absCol;
+        selection.startType = type;
+        selection.startCol = col;
+        selection.endTrack = track;
+        selection.endStep = step;
+        selection.endAbsCol = absCol;
+        selection.endType = type;
+        selection.endCol = col;
+    }
+
     var track = selection.startTrack;
     var absCol = selection.startAbsCol + colDelta;
     var step = selection.startStep + stepDelta;
@@ -1407,10 +1455,10 @@ function onEditInputKeyDown(e) {
         e.preventDefault();
         var cell = editingCell;
         finishEditing();
-        if (cell) {
+        if (cell && state.editStep > 0) {
             var info = getCellInfo(cell);
             if (info) {
-                // Move down
+                // Move down by edit step
                 var nextCell = findCellElement(info.track, info.step + state.editStep, info.col, info.type);
                 if (nextCell) selectCell(nextCell);
             }
@@ -1486,8 +1534,10 @@ function enterNoteInSelectionNoPreview(noteName) {
     setCellValue(info.track, info.step, info.col, 'note', noteName);
     updateCellDisplay(cell, 'note', noteName);
 
-    // Move down by edit step
-    navigateSelection(0, state.editStep);
+    // Move down by edit step (skip if editStep is 0)
+    if (state.editStep > 0) {
+        navigateSelection(0, state.editStep);
+    }
 }
 
 // Play a note preview (called on keydown)
@@ -1576,9 +1626,194 @@ function enterHexInFxSelection(hexDigit) {
     // Reset buffer after a short delay (for continuous typing)
     fxInputTimeout = setTimeout(function() {
         fxInputBuffer = '';
-        // Move down by edit step after input is complete
-        navigateSelection(0, state.editStep);
+        // Move down by edit step after input is complete (skip if editStep is 0)
+        if (state.editStep > 0) {
+            navigateSelection(0, state.editStep);
+        }
     }, 500);
+}
+
+// ============================================
+// CONTEXT MENU
+// ============================================
+
+var contextMenu = null;
+
+function initContextMenu() {
+    contextMenu = document.getElementById('context-menu');
+    if (!contextMenu) return;
+
+    // Hide menu on click outside
+    document.addEventListener('click', function(e) {
+        if (!contextMenu.contains(e.target)) {
+            hideContextMenu();
+        }
+    });
+
+    // Handle menu item clicks
+    contextMenu.addEventListener('click', function(e) {
+        var item = e.target.closest('.context-menu-item');
+        if (!item || item.classList.contains('disabled')) return;
+
+        var action = item.getAttribute('data-action');
+        hideContextMenu();
+
+        switch (action) {
+            case 'interpolate':
+                interpolateFxSelection();
+                break;
+            case 'clear':
+                clearSelectionData();
+                break;
+            case 'copy':
+                copySelection();
+                break;
+            case 'cut':
+                cutSelection();
+                break;
+            case 'paste':
+                pasteAtSelection();
+                break;
+        }
+    });
+}
+
+function showContextMenu(x, y) {
+    if (!contextMenu) return;
+
+    // Update menu item states
+    var interpolateItem = contextMenu.querySelector('[data-action="interpolate"]');
+    var hasFxSelection = checkFxSelection();
+
+    if (interpolateItem) {
+        if (hasFxSelection) {
+            interpolateItem.classList.remove('disabled');
+        } else {
+            interpolateItem.classList.add('disabled');
+        }
+    }
+
+    // Position menu
+    contextMenu.style.left = x + 'px';
+    contextMenu.style.top = y + 'px';
+    contextMenu.classList.add('visible');
+
+    // Ensure menu stays within viewport
+    var rect = contextMenu.getBoundingClientRect();
+    if (rect.right > window.innerWidth) {
+        contextMenu.style.left = (x - rect.width) + 'px';
+    }
+    if (rect.bottom > window.innerHeight) {
+        contextMenu.style.top = (y - rect.height) + 'px';
+    }
+}
+
+function hideContextMenu() {
+    if (contextMenu) {
+        contextMenu.classList.remove('visible');
+    }
+}
+
+function checkFxSelection() {
+    // Check if selection contains FX cells
+    for (var i = 0; i < selectedCells.length; i++) {
+        var info = getCellInfo(selectedCells[i]);
+        if (info && info.type === 'fx') {
+            return true;
+        }
+    }
+    return false;
+}
+
+function interpolateFxSelection() {
+    if (selectedCells.length < 2) {
+        consoleLog('Need at least 2 cells selected for interpolation');
+        return;
+    }
+
+    var pattern = getCurrentPattern();
+    var patternIndex = getCurrentPatternIndex();
+
+    // Get all selected FX cells sorted by step
+    var fxCells = [];
+    for (var i = 0; i < selectedCells.length; i++) {
+        var info = getCellInfo(selectedCells[i]);
+        if (info && info.type === 'fx') {
+            var stepData = pattern.data[info.track][info.step];
+            var fxStr = stepData.fx[info.col];
+            var value = null;
+            if (fxStr && fxStr !== '' && fxStr !== '--') {
+                value = parseInt(fxStr, 16);
+                if (isNaN(value)) value = null;
+            }
+            fxCells.push({
+                cell: selectedCells[i],
+                info: info,
+                value: value,
+                step: info.step
+            });
+        }
+    }
+
+    if (fxCells.length < 2) {
+        consoleLog('Need at least 2 FX cells selected for interpolation');
+        return;
+    }
+
+    // Sort by step
+    fxCells.sort(function(a, b) { return a.step - b.step; });
+
+    // Find first and last cells with values
+    var firstWithValue = null;
+    var lastWithValue = null;
+
+    for (var i = 0; i < fxCells.length; i++) {
+        if (fxCells[i].value !== null) {
+            if (firstWithValue === null) {
+                firstWithValue = i;
+            }
+            lastWithValue = i;
+        }
+    }
+
+    if (firstWithValue === null || lastWithValue === null || firstWithValue === lastWithValue) {
+        consoleLog('Need at least 2 cells with values for interpolation');
+        return;
+    }
+
+    // Interpolate between first and last value
+    var startValue = fxCells[firstWithValue].value;
+    var endValue = fxCells[lastWithValue].value;
+    var startStep = fxCells[firstWithValue].step;
+    var endStep = fxCells[lastWithValue].step;
+    var stepRange = endStep - startStep;
+
+    if (stepRange === 0) {
+        consoleLog('Cells must be on different steps');
+        return;
+    }
+
+    // Fill in interpolated values for cells without data
+    for (var i = firstWithValue; i <= lastWithValue; i++) {
+        var cell = fxCells[i];
+        if (cell.value === null) {
+            // Calculate interpolated value
+            var progress = (cell.step - startStep) / stepRange;
+            var interpolatedValue = Math.round(startValue + (endValue - startValue) * progress);
+
+            // Clamp to 0-255 (hex 00-FF)
+            interpolatedValue = Math.max(0, Math.min(255, interpolatedValue));
+
+            // Set the value
+            var hexValue = interpolatedValue.toString(16).toUpperCase().padStart(2, '0');
+            var stepData = pattern.data[cell.info.track][cell.info.step];
+            stepData.fx[cell.info.col] = hexValue;
+            updateCellDisplay(cell.cell, 'fx', hexValue);
+        }
+    }
+
+    markPatternDirty(patternIndex);
+    consoleLog('Interpolated FX: ' + startValue.toString(16).toUpperCase() + ' -> ' + endValue.toString(16).toUpperCase());
 }
 
 // ============================================
@@ -1880,13 +2115,15 @@ function recordNote(noteName) {
 
     // Note: Preview is handled by keydown/keyup handlers for proper note-on/note-off
 
-    // Move down
-    state.focusedStep = Math.min(state.focusedStep + state.editStep, pattern.steps - 1);
+    // Move down by edit step (skip if editStep is 0)
+    if (state.editStep > 0) {
+        state.focusedStep = Math.min(state.focusedStep + state.editStep, pattern.steps - 1);
 
-    var nextCell = findCellElement(trackIdx, state.focusedStep, colIdx, 'note');
-    if (nextCell) {
-        selectCell(nextCell);
-        nextCell.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+        var nextCell = findCellElement(trackIdx, state.focusedStep, colIdx, 'note');
+        if (nextCell) {
+            selectCell(nextCell);
+            nextCell.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+        }
     }
 }
 
@@ -2063,6 +2300,7 @@ function scheduleStep(scheduledTime) {
         if (!stepData) continue;
 
         var numNoteCols = state.tracks[trackIdx].noteColumns;
+        var noteTriggeredThisStep = false;
 
         for (var nc = 0; nc < numNoteCols; nc++) {
             if (!stepData.notes[nc]) {
@@ -2082,6 +2320,7 @@ function scheduleStep(scheduledTime) {
                 try {
                     csound.inputMessage('i -' + instrNumStr + ' ' + p2.toFixed(4) + ' 0');
                 } catch (err) {}
+                noteTriggeredThisStep = true;
                 continue;
             }
 
@@ -2095,6 +2334,7 @@ function scheduleStep(scheduledTime) {
 
                 var pfields = [instrNumStr, p2.toFixed(4), (duration === -1) ? -1 : duration.toFixed(4), freq.toFixed(4), amp.toFixed(4)];
 
+                // FX columns sent with note events (actual values)
                 for (var fc = 0; fc < stepData.fx.length; fc++) {
                     var fxStr = stepData.fx[fc];
                     var fxVal = 0;
@@ -2108,6 +2348,41 @@ function scheduleStep(scheduledTime) {
                 var noteMsg = 'i ' + pfields.join(' ');
                 try {
                     csound.inputMessage(noteMsg);
+                } catch (err) {}
+                noteTriggeredThisStep = true;
+            }
+        }
+
+        // FX-only automation: if no note was triggered but there's FX data, send automation event
+        // Uses -1 for freq to indicate this is an automation update, not a new note
+        if (!noteTriggeredThisStep) {
+            var hasFxData = false;
+            for (var fc = 0; fc < stepData.fx.length; fc++) {
+                var fxStr = stepData.fx[fc];
+                if (fxStr && fxStr !== '' && fxStr !== '--') {
+                    hasFxData = true;
+                    break;
+                }
+            }
+
+            if (hasFxData) {
+                // Send automation event for each active note column (use .00 for primary)
+                var instrNumStr = (trackIdx + 1) + '.00';
+                var pfields = [instrNumStr, p2.toFixed(4), 0, -1, 0];  // p3=0, p4=-1 (automation flag), p5=0
+
+                for (var fc = 0; fc < stepData.fx.length; fc++) {
+                    var fxStr = stepData.fx[fc];
+                    var fxVal = 0;
+                    if (fxStr && fxStr !== '' && fxStr !== '--') {
+                        fxVal = parseInt(fxStr, 16);
+                        if (isNaN(fxVal)) fxVal = 0;
+                    }
+                    pfields.push(fxVal);
+                }
+
+                var autoMsg = 'i ' + pfields.join(' ');
+                try {
+                    csound.inputMessage(autoMsg);
                 } catch (err) {}
             }
         }
@@ -4827,6 +5102,7 @@ function init() {
     initInstrumentTabs();
     initSampleLoader();
     initSampleEditor();
+    initContextMenu();
     renderSampleList();
 
     document.getElementById('step-count').value = getCurrentPattern().steps;
