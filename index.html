@@ -28,59 +28,98 @@
                 <button id="btn-play" disabled title="Play (Space)">&#9658;</button>
                 <button id="btn-stop" disabled title="Stop (Space)">&#9632;</button>
                 <button id="btn-record" title="Record (`)">&#9679; REC</button>
+                <button id="btn-loop" title="Toggle Loop (L)">&#8634; Loop</button>
+                <button id="btn-snap" class="active" title="Snap to Measure (N)">&#9632; Snap</button>
+                <select id="grid-snap" title="Grid Snap Resolution">
+                    <option value="0.015625">1/256</option>
+                    <option value="0.03125">1/128</option>
+                    <option value="0.0625">1/64</option>
+                    <option value="0.125">1/32</option>
+                    <option value="0.25">1/16</option>
+                    <option value="0.5">1/8</option>
+                    <option value="1" selected>1/4</option>
+                    <option value="2">1/2</option>
+                    <option value="4">1 Bar</option>
+                </select>
                 <div class="separator"></div>
                 <label>
                     BPM: <input type="number" id="bpm" value="120" min="20" max="300">
-                </label>
-                <label>
-                    LPB: <input type="number" id="lpb" value="4" min="1" max="32" title="Lines Per Beat">
-                </label>
-                <label>
-                    Edit Step: <input type="number" id="edit-step" value="1" min="0" max="16" title="Cursor movement after note entry">
                 </label>
                 <label>
                     Octave: <span id="octave-display">3</span>
                 </label>
                 <div class="separator"></div>
                 <label>
-                    Steps: <input type="number" id="step-count" value="64" min="1" max="999">
+                    MIDI: <select id="midi-input" title="MIDI Input Device">
+                        <option value="">None</option>
+                    </select>
                 </label>
-                <button id="btn-apply-steps">Apply</button>
             </div>
         </header>
 
         <div class="main-container">
-            <!-- Pattern Sequence Sidebar -->
-            <div class="sequence-sidebar">
-                <div class="sequence-header">
-                    <span>Sequence</span>
-                    <div class="sequence-buttons">
-                        <button id="btn-add-pattern" title="Add Pattern">+</button>
-                        <button id="btn-clone-pattern" title="Clone Pattern">C</button>
-                        <button id="btn-del-pattern" title="Delete Pattern">-</button>
+            <!-- Center Panel (Track Layout + Pattern Editor) -->
+            <div class="center-panel">
+                <!-- Track Layout Area (Track Sidebar + Timeline) -->
+                <div class="track-layout-area">
+                    <!-- Track List Sidebar (DAW-style) -->
+                    <div class="track-sidebar">
+                        <div class="track-sidebar-header">
+                            <span>Tracks</span>
+                            <div class="track-sidebar-buttons">
+                                <button id="btn-add-track" title="Add Track">+</button>
+                                <button id="btn-remove-track" title="Remove Track">-</button>
+                                <button id="btn-scroll-tracks-up" title="Scroll Up">&#9650;</button>
+                                <button id="btn-scroll-tracks-down" title="Scroll Down">&#9660;</button>
+                            </div>
+                        </div>
+                        <div id="track-list" class="track-list"></div>
+                        <div class="track-sidebar-footer">
+                            <span id="track-range-display">1 / 1</span>
+                        </div>
+                    </div>
+
+                    <!-- Timeline Area -->
+                    <div class="timeline-area">
+                        <div class="timeline-header">
+                            <div class="timeline-ruler" id="timeline-ruler"></div>
+                        </div>
+                        <div class="timeline-tracks" id="timeline-tracks"></div>
+                        <div class="timeline-info-bar">
+                            <span id="timeline-position-display">0:00 / 0:00 | M1/4</span>
+                        </div>
                     </div>
                 </div>
-                <div id="sequence-list"></div>
-                <div class="pattern-pool">
-                    <div class="pool-header">Patterns</div>
-                    <div id="pattern-pool-list"></div>
-                </div>
-            </div>
 
-            <!-- Center Editor Area -->
-            <div class="center-editor-area">
-                <!-- Editor View Tabs -->
+                <!-- View Tabs -->
                 <div class="editor-view-tabs">
                     <button class="editor-view-tab active" data-view="pattern">Pattern Editor</button>
                     <button class="editor-view-tab" data-view="sample">Sample Editor</button>
                 </div>
 
-                <!-- Tracker Grid (Pattern Editor) -->
-                <div class="tracker-container" id="pattern-editor-view">
-                    <div id="tracker-grid"></div>
+                <!-- Pattern Editor View -->
+                <div class="pattern-editor-area" id="pattern-editor-area">
+                    <div class="pattern-editor-header">
+                        <span id="pattern-editor-title">No pattern selected</span>
+                        <div class="pattern-editor-controls">
+                            <label>
+                                Steps: <input type="number" id="pattern-steps" value="16" min="1" max="256">
+                            </label>
+                            <label>
+                                LPB: <input type="number" id="pattern-lpb" value="4" min="1" max="32">
+                            </label>
+                            <label>
+                                Edit Step: <input type="number" id="edit-step" value="1" min="0" max="16" title="Cursor movement after note entry">
+                            </label>
+                            <button id="btn-apply-pattern-steps">Apply</button>
+                        </div>
+                    </div>
+                    <div class="tracker-container" id="tracker-container">
+                        <div id="tracker-grid"></div>
+                    </div>
                 </div>
 
-                <!-- Sample Editor -->
+                <!-- Sample Editor View -->
                 <div class="sample-editor-container hidden" id="sample-editor-view">
                     <div class="sample-editor-toolbar">
                         <div class="sample-info-display">
@@ -138,6 +177,7 @@
                     <button class="main-tab active" data-tab="instruments">Instruments</button>
                     <button class="main-tab" data-tab="opcodes">Opcodes</button>
                     <button class="main-tab" data-tab="samples">Sample Import</button>
+                    <button class="main-tab" data-tab="chords">Chords</button>
                 </div>
 
                 <!-- Instruments Tab Content -->
@@ -160,19 +200,39 @@
 
                 <!-- Sample Import Tab Content -->
                 <div class="tab-content hidden" id="tab-samples">
-                    <div class="sample-controls">
+                    <div class="sample-sections">
+                        <!-- Sample Library Section -->
+                        <div class="sample-section">
+                            <div class="sample-section-header">
+                                <span>Sample Library</span>
+                                <button id="btn-import-sample" title="Import samples to library">Import</button>
+                                <button id="btn-clear-library" title="Clear all samples from library and free memory">Clear</button>
+                                <input type="file" id="sample-file-input" accept=".wav,.aif,.aiff,.mp3,.ogg" multiple style="display:none">
+                            </div>
+                            <div id="sample-library-list" class="sample-list"></div>
+                            <div class="sample-section-info">Import samples here first, then load to ftables</div>
+                        </div>
+                        <!-- Ftable Pool Section -->
+                        <div class="sample-section">
+                            <div class="sample-section-header">
+                                <span>Ftable Pool</span>
+                                <span class="ftable-info">Next: ft<span id="next-ftable-num">100</span></span>
+                            </div>
+                            <div id="ftable-pool-list" class="sample-list"></div>
+                            <div class="sample-section-info">Use: <code>asig loscil 1, ifreq, itable</code></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Chords Tab Content -->
+                <div class="tab-content hidden" id="tab-chords">
+                    <div class="chords-header">
+                        <span>Click a chord to insert into selected track</span>
                         <label>
-                            Table #: <input type="number" id="sample-table-num" value="100" min="0" max="300">
+                            Octave: <input type="number" id="chord-octave" value="3" min="0" max="8">
                         </label>
-                        <button id="btn-load-sample">Load Sample</button>
-                        <input type="file" id="sample-file-input" accept=".wav,.aif,.aiff,.mp3,.ogg" style="display:none">
                     </div>
-                    <div class="sample-list-header">Loaded Samples:</div>
-                    <div id="sample-list"></div>
-                    <div class="sample-info">
-                        <p>Samples are loaded into Csound ftables.</p>
-                        <p>Use in instruments: <code>asig loscil 1, ifreq, itable</code></p>
-                    </div>
+                    <div class="chord-grid" id="chord-grid"></div>
                 </div>
             </div>
         </div>
@@ -196,6 +256,17 @@
             <div class="context-menu-item" data-action="copy">Copy</div>
             <div class="context-menu-item" data-action="cut">Cut</div>
             <div class="context-menu-item" data-action="paste">Paste</div>
+        </div>
+
+        <!-- Timeline Context Menu -->
+        <div id="timeline-context-menu" class="context-menu">
+            <div class="context-menu-item" data-action="add-pattern">Add Pattern</div>
+            <div class="context-menu-separator"></div>
+            <div class="context-menu-item" data-action="copy-clip">Copy Clip</div>
+            <div class="context-menu-item" data-action="cut-clip">Cut Clip</div>
+            <div class="context-menu-item" data-action="paste-clip">Paste Clip</div>
+            <div class="context-menu-separator"></div>
+            <div class="context-menu-item" data-action="delete-clip">Delete Clip</div>
         </div>
     </div>
 

@@ -159,10 +159,14 @@ header h1 {
     background: #0f3460;
     color: #eee;
     border: 1px solid #16213e;
-    padding: 4px 8px;
+    padding: 0.3em 0.5em;
     border-radius: 4px;
     font-family: inherit;
-    width: 55px;
+    width: 4em;
+}
+
+#grid-snap {
+    width: 5.5em;
 }
 
 #octave-display {
@@ -173,15 +177,49 @@ header h1 {
     text-align: center;
 }
 
+#midi-input {
+    width: auto;
+    max-width: 120px;
+}
+
 .main-container {
     display: flex;
     flex: 1;
     overflow: hidden;
 }
 
+/* Center Panel (contains track layout and pattern editor) */
+.center-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+/* Track Layout Area (Track Sidebar + Timeline in a row) */
+.track-layout-area {
+    display: flex;
+    flex-direction: row;
+    height: 420px;
+    min-height: 120px;
+    max-height: 420px;
+    border-bottom: 2px solid #0f3460;
+    flex-shrink: 0;
+}
+
+/* Main Editor Area (replaces center-editor-area) */
+.main-editor-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
 /* Sequence Sidebar */
 .sequence-sidebar {
-    width: 100px;
+    width: 6vw;
+    min-width: 70px;
+    max-width: 120px;
     background: #12122a;
     border-right: 2px solid #0f3460;
     display: flex;
@@ -293,12 +331,624 @@ header h1 {
     opacity: 0.5;
 }
 
-/* Center Editor Area (contains tabs and views) */
-.center-editor-area {
-    flex: 2;
+/* Track Sidebar (DAW-style) */
+.track-sidebar {
+    width: 140px;
+    min-width: 120px;
+    background: #12122a;
+    border-right: 2px solid #0f3460;
+    display: flex;
+    flex-direction: column;
+}
+
+.track-sidebar-header {
+    background: #0f3460;
+    padding: 8px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.85em;
+    font-weight: bold;
+    color: #4ecca3;
+}
+
+.track-sidebar-buttons {
+    display: flex;
+    gap: 4px;
+}
+
+.track-sidebar-buttons button {
+    background: #1a1a2e;
+    color: #eee;
+    border: none;
+    width: 22px;
+    height: 22px;
+    cursor: pointer;
+    border-radius: 3px;
+    font-size: 0.75em;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.track-sidebar-buttons button:hover {
+    background: #4ecca3;
+    color: #1a1a2e;
+}
+
+.track-list {
+    flex: 1;
+    overflow-y: scroll;  /* Allow scrolling but hide scrollbar */
+    overflow-x: hidden;
+    padding: 0;
+    margin-top: 24px; /* Match timeline ruler height */
+    scrollbar-width: none;  /* Firefox */
+    -ms-overflow-style: none;  /* IE/Edge */
+}
+
+/* Hide scrollbar for track-list - Chrome/Safari */
+.track-list::-webkit-scrollbar {
+    display: none;
+}
+
+.track-list-item {
+    background: #16213e;
+    height: 60px;
+    padding: 0 8px;
+    border-radius: 0;
+    font-size: 0.75em;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    cursor: pointer;
+    border-bottom: 1px solid #0f3460;
+    box-sizing: border-box;
+}
+
+.track-list-item:hover {
+    background: #1a1a2e;
+}
+
+.track-list-item.selected {
+    border-color: #e94560;
+    background: #1a1a2e;
+}
+
+.track-list-item.muted {
+    opacity: 0.5;
+}
+
+.track-list-item .track-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.track-list-item .track-controls {
+    display: flex;
+    gap: 2px;
+}
+
+.track-list-item .btn-track-mute,
+.track-list-item .btn-track-solo {
+    width: 18px;
+    height: 18px;
+    border: none;
+    border-radius: 2px;
+    font-size: 0.65em;
+    cursor: pointer;
+    background: #0f3460;
+    color: #888;
+}
+
+.track-list-item .btn-track-mute:hover,
+.track-list-item .btn-track-solo:hover {
+    background: #4ecca3;
+    color: #1a1a2e;
+}
+
+.track-list-item .btn-track-mute.active {
+    background: #e94560;
+    color: #fff;
+}
+
+.track-list-item .btn-track-solo.active {
+    background: #ffd93d;
+    color: #1a1a2e;
+}
+
+.track-sidebar-footer {
+    background: #0f3460;
+    padding: 6px;
+    text-align: center;
+    font-size: 0.75em;
+    color: #666;
+}
+
+/* Track Editor View (contains timeline) */
+.track-editor-view {
+    flex: 1;
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    min-height: 150px;
+}
+
+.track-editor-view.hidden {
+    display: none;
+}
+
+/* Timeline Area */
+.timeline-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    background: #1a1a2e;
+    overflow: hidden;
+    min-height: 100px;
+}
+
+.timeline-header {
+    height: 64px;
+    background: #16213e;
+    border-bottom: 1px solid #0f3460;
+    flex-shrink: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;  /* Firefox */
+}
+
+.timeline-header::-webkit-scrollbar {
+    display: none;  /* Chrome/Safari */
+}
+
+.timeline-ruler {
+    height: 100%;
+    display: flex;
+    align-items: center;
+    padding: 0 4px;
+    font-size: 0.7em;
+    color: #666;
+}
+
+.timeline-ruler .beat-marker {
+    position: absolute;
+    color: #888;
+    font-size: 0.9em;
+}
+
+.timeline-ruler .bar-marker {
+    color: #4ecca3;
+    font-weight: bold;
+}
+
+.timeline-ruler .sub-marker {
+    position: absolute;
+    color: #444;
+    font-size: 0.8em;
+}
+
+.timeline-tracks {
+    flex: 1;
+    overflow: auto;
+    position: relative;
+}
+
+/* Inner content wrapper - this is what creates the scrollable area */
+.timeline-content {
+    display: flex;
+    flex-direction: column;
+    min-height: 100%;
+}
+
+/* Style the native scrollbar in timeline-tracks */
+.timeline-tracks::-webkit-scrollbar {
+    height: 14px;
+    width: 14px;
+}
+
+.timeline-tracks::-webkit-scrollbar-track {
+    background: #1a1a2e;
+}
+
+.timeline-tracks::-webkit-scrollbar-thumb {
+    background: #4ecca3;
+    border-radius: 4px;
+    border: 2px solid #1a1a2e;
+}
+
+.timeline-tracks::-webkit-scrollbar-thumb:hover {
+    background: #6ee6b8;
+}
+
+.timeline-tracks::-webkit-scrollbar-corner {
+    background: #1a1a2e;
+}
+
+/* Timeline info bar (below tracks) */
+.timeline-info-bar {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    padding: 4px 8px;
+    background: #0a0a1a;
+    border-top: 1px solid #0f3460;
+    flex-shrink: 0;
+}
+
+#timeline-position-display {
+    font-size: 11px;
+    color: #4ecca3;
+    font-family: monospace;
+}
+
+.timeline-track-row {
+    height: 60px;
+    border-bottom: 1px solid #0f3460;
+    position: relative;
+    box-sizing: border-box;
+}
+
+.timeline-track-row:nth-child(even) {
+    background: rgba(15, 52, 96, 0.2);
+}
+
+.timeline-clip {
+    position: absolute;
+    height: 54px;
+    top: 2px;
+    border-radius: 4px;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    font-size: 0.7em;
+    color: #fff;
+    overflow: hidden;
+    user-select: none;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+    min-width: 30px;
+}
+
+.timeline-clip:hover {
+    filter: brightness(1.1);
+}
+
+.timeline-clip.selected {
+    box-shadow: 0 0 0 2px #e94560, 0 2px 6px rgba(233, 69, 96, 0.4);
+}
+
+/* Clip header with name */
+.timeline-clip .clip-header {
+    padding: 2px 20px 2px 18px;
+    font-size: 0.85em;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    background: rgba(0,0,0,0.2);
+    color: rgba(255,255,255,0.9);
+}
+
+/* Note visualization canvas */
+.timeline-clip .clip-note-viz {
+    flex: 1;
+    width: 100%;
+    pointer-events: none;
+}
+
+/* Loop handle - top left */
+.timeline-clip .clip-loop-handle {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 16px;
+    height: 14px;
+    background: rgba(0,0,0,0.3);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 9px;
+    border-radius: 4px 0 4px 0;
+    opacity: 0.7;
+    transition: opacity 0.15s;
+}
+
+.timeline-clip .clip-loop-handle:hover {
+    opacity: 1;
+    background: rgba(255,215,0,0.8);
+    color: #1a1a2e;
+}
+
+/* Expand handle - mid left */
+.timeline-clip .clip-expand-handle {
+    position: absolute;
+    top: 16px;
+     right: 0;
+    width: 16px;
+    height: 18px;
+    background: rgba(0,0,0,0.3);
+    cursor: ew-resize;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    border-radius: 0 4px 4px 0;
+    opacity: 0.7;
+    transition: opacity 0.15s;
+}
+
+.timeline-clip .clip-expand-handle:hover {
+    opacity: 1;
+    background: rgba(108, 99, 255, 0.8);
+}
+
+
+
+.timeline-clip .clip-resize-handle:hover {
+    background: rgba(255,255,255,0.3);
+}
+
+/* Split handle - appears on hover */
+.timeline-clip .clip-split-handle {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 20px;
+    height: 20px;
+    background: #e94560;
+    border-radius: 50%;
+    cursor: crosshair;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    color: #fff;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+    z-index: 10;
+}
+
+.timeline-clip .clip-split-handle:hover {
+    background: #ff6b8a;
+    transform: translateY(-50%) scale(1.1);
+}
+
+/* Library item dragging */
+.library-item.dragging {
+    opacity: 0.5;
+}
+
+.library-item {
+    cursor: grab;
+}
+
+.library-item:active {
+    cursor: grabbing;
+}
+
+.timeline-grid-line {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: #0f3460;
+    pointer-events: none;
+}
+
+.timeline-grid-line.bar {
+    background: #16213e;
+}
+
+.timeline-playhead {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: #e94560;
+    pointer-events: none;
+    z-index: 10;
+}
+
+/* Song end marker (draggable) */
+.timeline-end-marker {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 6px;
+    background: linear-gradient(90deg, #ffd93d 0%, transparent 100%);
+    cursor: ew-resize;
+    z-index: 5;
+}
+
+.timeline-end-marker::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: #ffd93d;
+}
+
+.timeline-end-marker:hover {
+    background: linear-gradient(90deg, #ff9f43 0%, transparent 100%);
+}
+
+.timeline-end-marker:hover::before {
+    background: #ff9f43;
+}
+
+/* Loop region overlay */
+.timeline-loop-region {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    background: rgba(78, 204, 163, 0.15);
+    pointer-events: none;
+    z-index: 1;
+}
+
+/* Loop start/end markers (draggable) */
+.timeline-loop-start,
+.timeline-loop-end {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 8px;
+    background: #4ecca3;
+    cursor: ew-resize;
+    z-index: 6;
+}
+
+.timeline-loop-start {
+    border-radius: 4px 0 0 4px;
+}
+
+.timeline-loop-end {
+    border-radius: 0 4px 4px 0;
+}
+
+.timeline-loop-start:hover,
+.timeline-loop-end:hover {
+    background: #6ee6b8;
+}
+
+.timeline-loop-start::before,
+.timeline-loop-end::before {
+    content: '⟨';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    color: #1a1a2e;
+    font-size: 12px;
+    font-weight: bold;
+}
+
+.timeline-loop-end::before {
+    content: '⟩';
+}
+
+/* Arrangement end marker (shows where clips end, snapped to measure) */
+.timeline-arrangement-end {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: rgba(108, 99, 255, 0.6);
+    pointer-events: none;
+    z-index: 4;
+}
+
+.timeline-arrangement-end::before {
+    content: '▼';
+    position: absolute;
+    top: -2px;
+    left: -5px;
+    font-size: 10px;
+    color: #6c63ff;
+}
+
+/* Pattern Editor Area (below track layout) */
+.pattern-editor-area {
+    display: flex;
+    flex-direction: column;
+    background: #12122a;
+    flex: 1;
+    overflow: hidden;
+    margin-left: 140px;  /* Align with timeline (after track sidebar) */
+}
+
+.pattern-editor-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #16213e;
+    padding: 6px 12px;
+    border-bottom: 1px solid #0f3460;
+    flex-shrink: 0;
+}
+
+#pattern-editor-title {
+    color: #4ecca3;
+    font-weight: bold;
+    font-size: 0.9em;
+}
+
+.pattern-editor-controls {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.pattern-editor-controls label {
+    font-size: 0.8em;
+    color: #888;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.pattern-editor-controls input[type="number"] {
+    width: 50px;
+    background: #0f3460;
+    color: #eee;
+    border: 1px solid #16213e;
+    padding: 2px 4px;
+    border-radius: 3px;
+    font-size: 0.9em;
+}
+
+.pattern-editor-controls button {
+    background: #4ecca3;
+    color: #1a1a2e;
+    border: none;
+    padding: 4px 10px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.8em;
+    font-weight: bold;
+}
+
+.pattern-editor-controls button:hover {
+    background: #5fd9b4;
+}
+
+.pattern-editor-controls .column-label {
+    font-size: 0.8em;
+    color: #4ecca3;
+    margin-left: 8px;
+}
+
+.pattern-editor-controls #note-col-count {
+    font-size: 0.85em;
+    color: #eee;
+    background: #0f3460;
+    padding: 2px 8px;
+    border-radius: 3px;
+    min-width: 20px;
+    text-align: center;
+}
+
+.pattern-editor-controls #btn-note-col-minus,
+.pattern-editor-controls #btn-note-col-plus {
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    font-size: 1em;
+    background: #0f3460;
+    color: #eee;
+}
+
+.pattern-editor-controls #btn-note-col-minus:hover,
+.pattern-editor-controls #btn-note-col-plus:hover {
+    background: #e94560;
+    color: #fff;
+}
+
+.pattern-editor-area.hidden {
+    display: none;
 }
 
 /* Editor View Tabs */
@@ -334,12 +984,13 @@ header h1 {
     background: #16213e;
 }
 
-/* Tracker Container */
+/* Tracker Container (inside pattern-editor-container) */
 .tracker-container {
     flex: 1;
     overflow: auto;
-    padding: 10px;
+    padding: 8px;
     position: relative;
+    background: #16213e;
 }
 
 .tracker-container.hidden {
@@ -626,6 +1277,165 @@ header h1 {
     white-space: nowrap;
 }
 
+/* Piano Roll Editor */
+.piano-roll-container {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    background: #1a1a2e;
+    overflow: hidden;
+}
+
+.piano-roll-container.hidden {
+    display: none;
+}
+
+.piano-roll-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #16213e;
+    padding: 8px 12px;
+    border-bottom: 1px solid #0f3460;
+}
+
+.piano-roll-info {
+    display: flex;
+    gap: 16px;
+    color: #4ecca3;
+    font-size: 0.85em;
+}
+
+.piano-roll-controls {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.piano-roll-controls label {
+    font-size: 0.8em;
+    color: #888;
+}
+
+.piano-roll-controls select {
+    background: #0f3460;
+    color: #eee;
+    border: 1px solid #16213e;
+    border-radius: 3px;
+    padding: 4px 8px;
+    font-size: 0.85em;
+}
+
+.piano-roll-controls button {
+    background: #0f3460;
+    color: #eee;
+    border: none;
+    width: 28px;
+    height: 28px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.9em;
+}
+
+.piano-roll-controls button:hover {
+    background: #4ecca3;
+    color: #1a1a2e;
+}
+
+.piano-roll-main {
+    flex: 1;
+    display: flex;
+    overflow: hidden;
+}
+
+.piano-keys {
+    width: 60px;
+    background: #16213e;
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+}
+
+.piano-key {
+    height: 16px;
+    display: flex;
+    align-items: center;
+    padding-left: 4px;
+    font-size: 0.65em;
+    border-bottom: 1px solid #0f3460;
+    cursor: pointer;
+    user-select: none;
+}
+
+.piano-key.white {
+    background: #ddd;
+    color: #333;
+}
+
+.piano-key.black {
+    background: #333;
+    color: #aaa;
+}
+
+.piano-key:hover {
+    background: #4ecca3;
+    color: #1a1a2e;
+}
+
+.piano-key.playing {
+    background: #e94560;
+    color: #fff;
+}
+
+.piano-grid-container {
+    flex: 1;
+    overflow: auto;
+    position: relative;
+}
+
+#piano-roll-canvas {
+    display: block;
+}
+
+.velocity-lane {
+    height: 60px;
+    background: #12122a;
+    border-top: 1px solid #0f3460;
+    flex-shrink: 0;
+}
+
+#velocity-canvas {
+    width: 100%;
+    height: 100%;
+}
+
+.piano-note {
+    position: absolute;
+    background: #4ecca3;
+    border-radius: 2px;
+    cursor: pointer;
+    min-width: 4px;
+}
+
+.piano-note:hover {
+    background: #5fd9b4;
+}
+
+.piano-note.selected {
+    background: #e94560;
+}
+
+.piano-note .note-resize-handle {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    width: 4px;
+    cursor: ew-resize;
+}
+
 #tracker-grid {
     display: flex;
     gap: 2px;
@@ -640,11 +1450,11 @@ header h1 {
 .track {
     background: #16213e;
     border-radius: 4px;
-    min-width: 160px;
+    min-width: 10em;
 }
 
 .track.collapsed {
-    min-width: 40px;
+    min-width: 3em;
 }
 
 .track.collapsed .track-rows,
@@ -652,7 +1462,8 @@ header h1 {
     display: none;
 }
 
-.track.muted {
+.track.muted,
+.track.silenced {
     opacity: 0.4;
 }
 
@@ -744,20 +1555,20 @@ header h1 {
     position: relative;
 }
 
-/* Column labels row */
+/* Column labels row - uses same sizing as data cells for perfect alignment */
 .column-labels {
     display: flex;
     background: #0f3460;
     border-bottom: 1px solid #1a1a2e;
-    font-size: 0.6em;
     color: #888;
     position: sticky;
-    top: 52px;
     z-index: 9;
 }
 
 .column-labels .row-number {
     background: transparent;
+    width: 2.5em;
+    font-size: 0.7em;
 }
 
 .column-labels .note-columns,
@@ -771,21 +1582,25 @@ header h1 {
 }
 
 .column-labels .cell {
-    padding: 2px 3px;
+    padding: 0.2em;
     text-align: center;
     border-right: 1px solid #1a1a2e;
+    font-size: 0.8em;
 }
 
 .column-labels .cell.note-label {
     color: #4ecca3;
+    width: 3.5em;
 }
 
 .column-labels .cell.amp-label {
     color: #ffd93d;
+    width: 2.5em;
 }
 
 .column-labels .cell.fx-label {
     color: #6c63ff;
+    width: 4.5em;
 }
 
 .track-row {
@@ -811,14 +1626,99 @@ header h1 {
 }
 
 .row-number {
-    width: 30px;
-    padding: 3px;
+    width: 2.5em;
+    padding: 0.2em;
     text-align: center;
     background: #0f3460;
     color: #888;
     font-size: 0.7em;
 }
 
+/* Note column group (note + amp + fx columns) */
+.note-column-group {
+    display: flex;
+    border-right: 2px solid #e94560;
+}
+
+.note-column-group:last-child {
+    border-right: none;
+}
+
+/* FX controls in column labels */
+.fx-controls {
+    display: flex;
+    align-items: center;
+    padding: 0 2px;
+}
+
+.fx-controls button {
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    font-size: 0.75em;
+    background: #0f3460;
+    color: #eee;
+    border: 1px solid #1a1a2e;
+    cursor: pointer;
+    margin: 0 1px;
+}
+
+.fx-controls button:hover {
+    background: #e94560;
+}
+
+/* Per-note-column FX +/- buttons in label row */
+.fx-col-controls {
+    display: flex;
+    align-items: center;
+    padding: 0 2px;
+    gap: 1px;
+}
+
+.fx-col-controls button {
+    width: 20px;
+    height: 18px;
+    padding: 0;
+    font-size: 0.7em;
+    background: #16213e;
+    color: #6c63ff;
+    border: 1px solid #1a1a2e;
+    cursor: pointer;
+    border-radius: 2px;
+}
+
+.fx-col-controls button:hover {
+    background: #6c63ff;
+    color: #fff;
+}
+
+/* Note column +/- controls at end of labels row */
+.note-col-controls {
+    display: flex;
+    align-items: center;
+    padding: 0 4px;
+    gap: 2px;
+}
+
+.note-col-controls button {
+    width: 24px;
+    height: 18px;
+    padding: 0;
+    font-size: 0.7em;
+    background: #4ecca3;
+    color: #1a1a2e;
+    border: none;
+    cursor: pointer;
+    border-radius: 2px;
+    font-weight: bold;
+}
+
+.note-col-controls button:hover {
+    background: #e94560;
+    color: #fff;
+}
+
+/* Legacy support */
 .note-columns {
     display: flex;
     border-right: 2px solid #e94560;
@@ -829,8 +1729,8 @@ header h1 {
 }
 
 .cell {
-    width: 36px;
-    padding: 3px;
+    width: 3em;
+    padding: 0.2em;
     text-align: center;
     font-size: 0.8em;
     border-right: 1px solid #1a1a2e;
@@ -869,7 +1769,7 @@ body.selecting * {
 
 .cell.note {
     color: #4ecca3;
-    width: 42px;
+    width: 3.5em;
 }
 
 .cell.note-off {
@@ -878,7 +1778,7 @@ body.selecting * {
 
 .cell.amp {
     color: #ffd93d;
-    width: 30px;
+    width: 2.5em;
 }
 
 .fx-columns {
@@ -887,14 +1787,125 @@ body.selecting * {
 
 .fx-column .cell {
     color: #6c63ff;
-    width: 42px;  /* Wide enough for 4-digit hex (FFFF) */
+    width: 4.5em;
+}
+
+/* FX cells within note column groups */
+.cell.fx {
+    color: #6c63ff;
+    width: 4.5em;
+}
+
+.column-labels .cell.fx-label {
+    color: #6c63ff;
+    width: 4.5em;
+}
+
+/* Param columns (p6, p7, etc.) */
+.param-columns {
+    display: flex;
+}
+
+.param-column {
+    display: flex;
+}
+
+.param-column .cell {
+    color: #ff9f43;
+    width: 3.5em;
+}
+
+.cell.param {
+    color: #ff9f43;
+    width: 3.5em;
+}
+
+.column-labels .cell.param-label {
+    color: #ff9f43;
+    width: 3.5em;
+}
+
+/* Single track view */
+.track.single-track {
+    min-width: auto;
+    width: 100%;
+}
+
+.track.single-track .track-header {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+}
+
+/* Pattern control bar (above columns) */
+.pattern-control-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #0f3460;
+    padding: 6px 12px;
+    border-bottom: 1px solid #1a1a2e;
+    position: sticky;
+    top: 0;
+    z-index: 25;
+}
+
+.pattern-instr-select {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.pattern-instr-select label {
+    font-size: 0.8em;
+    color: #4ecca3;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.pattern-instr-select select {
+    background: #1a1a2e;
+    color: #eee;
+    border: 1px solid #16213e;
+    padding: 3px 6px;
+    border-radius: 3px;
+    font-size: 0.85em;
+    width: 60px;
+}
+
+.pattern-col-controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.pattern-col-controls button {
+    background: #1a1a2e;
+    color: #eee;
+    border: 1px solid #16213e;
+    padding: 4px 10px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.75em;
+    font-weight: bold;
+}
+
+.pattern-col-controls button:hover {
+    background: #4ecca3;
+    color: #1a1a2e;
+}
+
+.pattern-col-controls .control-sep {
+    color: #333;
+    font-size: 0.8em;
 }
 
 /* Editor Container */
 .editor-container {
     flex: 1;
-    min-width: 350px;
-    max-width: 500px;
+    min-width: 20vw;
+    max-width: 30vw;
     background: #16213e;
     border-left: 2px solid #0f3460;
     display: flex;
@@ -1018,6 +2029,13 @@ body.selecting * {
 .instr-tab.instr-more-btn:hover {
     background: #4ecca3;
     color: #1a1a2e;
+}
+
+.instr-page-info {
+    padding: 0.25em 0.5em;
+    color: #666;
+    font-size: 0.75em;
+    align-self: center;
 }
 
 #code-editor, #opcodes-editor {
@@ -1185,6 +2203,236 @@ body.selecting * {
     background: #ff6b8a;
 }
 
+/* Sample Sections Layout */
+.sample-sections {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    gap: 10px;
+    padding: 10px;
+}
+
+.sample-section {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    background: #12122a;
+    border-radius: 4px;
+    overflow: hidden;
+    min-height: 100px;
+}
+
+.sample-section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    background: #0f3460;
+    font-size: 0.9em;
+    color: #fff;
+}
+
+.sample-section-header button {
+    background: #4ecca3;
+    color: #1a1a2e;
+    border: none;
+    padding: 4px 12px;
+    cursor: pointer;
+    border-radius: 3px;
+    font-size: 0.85em;
+}
+
+.sample-section-header button:hover {
+    background: #6fffca;
+}
+
+.sample-section-header button#btn-clear-library {
+    background: #e94560;
+    color: #fff;
+}
+
+.sample-section-header button#btn-clear-library:hover {
+    background: #ff6b8a;
+}
+
+.sample-section-header .ftable-info {
+    font-size: 0.8em;
+    color: #ffd93d;
+}
+
+.sample-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 5px;
+    background: #1a1a2e;
+}
+
+.sample-list.drag-over {
+    background: #1f2a4a;
+    outline: 2px dashed #4ecca3;
+}
+
+.sample-list-empty {
+    padding: 15px;
+    text-align: center;
+    color: #666;
+    font-size: 0.8em;
+    font-style: italic;
+}
+
+.sample-section-info {
+    padding: 6px 10px;
+    background: #0a0a14;
+    font-size: 0.7em;
+    color: #666;
+}
+
+.sample-section-info code {
+    background: #0f3460;
+    padding: 1px 4px;
+    border-radius: 2px;
+    color: #4ecca3;
+}
+
+/* Library item - can be loaded to ftable */
+.library-item {
+    display: flex;
+    align-items: center;
+    padding: 5px 8px;
+    background: #16213e;
+    border-radius: 3px;
+    margin-bottom: 3px;
+    gap: 8px;
+}
+
+.library-item:hover {
+    background: #1f2a4a;
+}
+
+.library-item .sample-name {
+    flex: 1;
+    color: #aaa;
+    font-size: 0.85em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.library-item .sample-size {
+    color: #666;
+    font-size: 0.75em;
+}
+
+.library-item .btn-load-ftable {
+    background: #4ecca3;
+    color: #1a1a2e;
+    border: none;
+    padding: 2px 8px;
+    cursor: pointer;
+    border-radius: 2px;
+    font-size: 0.75em;
+}
+
+.library-item .btn-load-ftable:hover {
+    background: #6fffca;
+}
+
+.library-item .btn-remove {
+    background: #e94560;
+    color: #fff;
+    border: none;
+    padding: 2px 6px;
+    cursor: pointer;
+    border-radius: 2px;
+    font-size: 0.75em;
+}
+
+.library-item .btn-remove:hover {
+    background: #ff6b8a;
+}
+
+/* Ftable pool item */
+.ftable-item {
+    display: flex;
+    align-items: center;
+    padding: 5px 8px;
+    background: #16213e;
+    border-radius: 3px;
+    margin-bottom: 3px;
+    gap: 8px;
+    cursor: grab;
+    transition: transform 0.1s, opacity 0.1s;
+}
+
+.ftable-item:hover {
+    background: #1f2a4a;
+}
+
+.ftable-item.dragging {
+    opacity: 0.4;
+    cursor: grabbing;
+}
+
+.ftable-item.drag-above {
+    border-top: 2px solid #4ecca3;
+    margin-top: -2px;
+}
+
+.ftable-item.drag-below {
+    border-bottom: 2px solid #4ecca3;
+    margin-bottom: 1px;
+}
+
+.ftable-item .ftable-num {
+    color: #ffd93d;
+    font-weight: bold;
+    font-size: 0.85em;
+    min-width: 45px;
+}
+
+.ftable-item .sample-name {
+    flex: 1;
+    color: #4ecca3;
+    font-size: 0.85em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.ftable-item .sample-name:hover {
+    color: #6fffca;
+    text-decoration: underline;
+}
+
+.ftable-item .btn-play {
+    background: #4ecca3;
+    color: #1a1a2e;
+    border: none;
+    padding: 2px 8px;
+    cursor: pointer;
+    border-radius: 2px;
+    font-size: 0.8em;
+}
+
+.ftable-item .btn-play:hover {
+    background: #6fffca;
+}
+
+.ftable-item .btn-delete {
+    background: #e94560;
+    color: #fff;
+    border: none;
+    padding: 2px 6px;
+    cursor: pointer;
+    border-radius: 2px;
+    font-size: 0.75em;
+}
+
+.ftable-item .btn-delete:hover {
+    background: #ff6b8a;
+}
+
 .sample-info {
     padding: 10px;
     background: #12122a;
@@ -1208,7 +2456,7 @@ body.selecting * {
 #console-container {
     background: #0a0a14;
     border-top: 2px solid #0f3460;
-    height: 150px;
+    height: 10em;
     display: flex;
     flex-direction: column;
 }
@@ -1360,4 +2608,125 @@ body.selecting * {
     height: 1px;
     background: #0f3460;
     margin: 4px 8px;
+}
+
+/* Chords Tab */
+.chords-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 10px;
+    background: #0f3460;
+    color: #888;
+    font-size: 0.8em;
+}
+
+.chords-header label {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    color: #eee;
+}
+
+.chords-header input[type="number"] {
+    width: 3.5em;
+    background: #1a1a2e;
+    color: #eee;
+    border: 1px solid #16213e;
+    padding: 0.2em 0.4em;
+    border-radius: 3px;
+    font-family: inherit;
+}
+
+.chord-grid {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+    background: #1a1a2e;
+}
+
+.chord-row {
+    display: flex;
+    align-items: center;
+    margin-bottom: 2px;
+    gap: 2px;
+}
+
+.chord-root {
+    width: 24px;
+    font-weight: bold;
+    color: #e94560;
+    font-size: 0.75em;
+    text-align: center;
+    flex-shrink: 0;
+}
+
+.chord-buttons {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 2px;
+    flex: 1;
+    overflow-x: auto;
+}
+
+.chord-btn {
+    background: #0f3460;
+    color: #eee;
+    border: none;
+    padding: 3px 4px;
+    cursor: pointer;
+    border-radius: 2px;
+    font-family: inherit;
+    font-size: 0.65em;
+    min-width: 28px;
+    flex-shrink: 0;
+    transition: background 0.1s;
+}
+
+.chord-btn:hover {
+    background: #4ecca3;
+    color: #1a1a2e;
+}
+
+.chord-btn:active {
+    background: #e94560;
+    color: #fff;
+}
+
+.chord-btn.major {
+    border-left: 2px solid #4ecca3;
+}
+
+.chord-btn.minor {
+    border-left: 2px solid #6c63ff;
+}
+
+/* ============================================
+   RESPONSIVE SCALING
+   ============================================ */
+
+/* Base scaling - font size scales with viewport width */
+html {
+    font-size: clamp(10px, 0.9vw + 4px, 20px);
+}
+
+/* High DPI / Retina displays */
+@media (-webkit-min-device-pixel-ratio: 2), (min-resolution: 192dpi) {
+    html {
+        font-size: clamp(11px, 0.85vw + 5px, 18px);
+    }
+}
+
+/* Very small screens */
+@media (max-width: 1024px) {
+    .header-top {
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
+    .demo-controls {
+        margin-left: 0;
+        padding-left: 0;
+        border-left: none;
+    }
 }
