@@ -117,6 +117,29 @@
                     <div class="tracker-container" id="tracker-container">
                         <div id="tracker-grid"></div>
                     </div>
+                    <div class="piano-roll-container hidden" id="piano-roll-container">
+                        <div class="piano-roll-toolbar">
+                            <label>Inst: <select id="piano-instrument"></select></label>
+                            <label>Snap: <select id="piano-quantize">
+                                <option value="1">1 Beat</option>
+                                <option value="0.5">1/2</option>
+                                <option value="0.25" selected>1/4</option>
+                                <option value="0.125">1/8</option>
+                                <option value="0.0625">1/16</option>
+                            </select></label>
+                            <button id="btn-piano-zoom-in">+</button>
+                            <button id="btn-piano-zoom-out">-</button>
+                        </div>
+                        <div class="piano-roll-main">
+                            <div class="piano-keys" id="piano-keys"></div>
+                            <div class="piano-roll-grid">
+                                <canvas id="piano-roll-canvas"></canvas>
+                            </div>
+                        </div>
+                        <div class="velocity-lane">
+                            <canvas id="velocity-canvas"></canvas>
+                        </div>
+                    </div>
                 </div>
 
                 <!-- Sample Editor View -->
@@ -261,12 +284,18 @@
         <!-- Timeline Context Menu -->
         <div id="timeline-context-menu" class="context-menu">
             <div class="context-menu-item" data-action="add-pattern">Add Pattern</div>
+            <div class="context-menu-item" data-action="add-piano-roll">Add Piano Roll</div>
             <div class="context-menu-separator"></div>
             <div class="context-menu-item" data-action="copy-clip">Copy Clip</div>
             <div class="context-menu-item" data-action="cut-clip">Cut Clip</div>
             <div class="context-menu-item" data-action="paste-clip">Paste Clip</div>
             <div class="context-menu-separator"></div>
             <div class="context-menu-item" data-action="delete-clip">Delete Clip</div>
+        </div>
+
+        <!-- Code Editor Context Menu -->
+        <div id="code-editor-context-menu" class="context-menu">
+            <div class="context-menu-item" data-action="insert-sampler">Insert Sampler</div>
         </div>
     </div>
 

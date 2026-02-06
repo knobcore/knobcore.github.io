@@ -478,6 +478,7 @@ function createPianoPattern(beats, lpb, trackId) {
         trackId: trackId || 0,    // Which track this pattern belongs to
         beats: beats || 4,        // Length in beats
         lpb: lpb || state.lpb,
+        instrument: 1,            // Default instrument
         notes: []                 // Array of { pitch, startBeat, duration, velocity }
     };
     return pattern;
@@ -582,6 +583,26 @@ function getClipsAtBeat(beat) {
     return activeClips;
 }
 
+// Find a piano roll pattern at the given beat on the selected track
+function findPianoRollAtBeat(beat) {
+    var trackId = state.selectedTrack;
+    if (trackId === undefined || trackId === null) return null;
+
+    var track = state.tracks[trackId];
+    if (!track) return null;
+
+    for (var c = 0; c < track.clips.length; c++) {
+        var clip = track.clips[c];
+        if (beat >= clip.startBeat && beat < getClipEndBeat(clip)) {
+            var pattern = state.patterns[clip.patternId];
+            if (pattern && pattern.type === 'piano') {
+                return { clip: clip, pattern: pattern, trackId: trackId };
+            }
+        }
+    }
+    return null;
+}
+
 // Convert beat position to step within a pattern (accounting for loops)
 // Returns { step, loopCount } for tracking duplicate triggers
 function beatToPatternStep(clip, beat) {
@@ -606,6 +627,23 @@ function beatToPatternStep(clip, beat) {
     var step = Math.floor(loopBeat * patternLpb);
 
     return { step: Math.min(step, pattern.steps - 1), loopCount: loopCount };
+}
+
+// Get the currently selected clip
+function getSelectedClip() {
+    if (!state.selectedClip || state.selectedClip.trackId === null || state.selectedClip.clipId === null) {
+        return null;
+    }
+
+    var track = state.tracks[state.selectedClip.trackId];
+    if (!track) return null;
+
+    for (var i = 0; i < track.clips.length; i++) {
+        if (track.clips[i].id === state.selectedClip.clipId) {
+            return track.clips[i];
+        }
+    }
+    return null;
 }
 
 // ============================================
@@ -1021,13 +1059,6 @@ function createClipElement(clip, trackId) {
     loopHandle.innerHTML = '⟳';
     el.appendChild(loopHandle);
 
-    // Expand handle (mid-left) - changes pattern steps
-    var expandHandle = document.createElement('div');
-    expandHandle.className = 'clip-expand-handle';
-    expandHandle.title = 'Drag to resize pattern (change steps)';
-    expandHandle.innerHTML = '⇔';
-    el.appendChild(expandHandle);
-
     // Right resize handle for loop count (drag edge)
     var resizeHandle = document.createElement('div');
     resizeHandle.className = 'clip-resize-handle';
@@ -1241,40 +1272,35 @@ function renderTimelineRuler() {
     var endBeat = Math.min(state.timeline.totalBeats, Math.ceil((scrollLeft + viewWidth) / timelinePixelsPerBeat) + beatsPerBar);
 
     // Determine finest subdivision to show based on zoom level (min ~20px between labels)
-    // Each level is a subdivision of a beat
     var subdivisions = [
-        { div: 1/64, label: '/256' },   // 256th notes (1/64 of a beat in 4/4)
-        { div: 1/32, label: '/128' },   // 128th notes
-        { div: 1/16, label: '/64' },    // 64th notes
-        { div: 1/8,  label: '/32' },    // 32nd notes
-        { div: 1/4,  label: '/16' },    // 16th notes
-        { div: 1/2,  label: '/8' },     // 8th notes
-        { div: 1,    label: '' },       // quarter notes (beats)
+        { div: 1/64 },   // 256th notes
+        { div: 1/32 },   // 128th notes
+        { div: 1/16 },   // 64th notes
+        { div: 1/8 },    // 32nd notes
+        { div: 1/4 },    // 16th notes
+        { div: 1/2 },    // 8th notes
+        { div: 1 },      // quarter notes (beats)
     ];
 
-    // Find finest subdivision where markers are at least 20px apart
-    var subDiv = 1; // default to beats
-    var subLabel = '';
+    var subDiv = 1;
     for (var s = 0; s < subdivisions.length; s++) {
-        var pxApart = subdivisions[s].div * timelinePixelsPerBeat;
-        if (pxApart >= 20) {
+        if (subdivisions[s].div * timelinePixelsPerBeat >= 20) {
             subDiv = subdivisions[s].div;
-            subLabel = subdivisions[s].label;
             break;
         }
     }
 
-    // Render markers at subdivision resolution within visible range
-    var stepSize = subDiv;
-    var snapStart = Math.floor(startBeat / stepSize) * stepSize;
+    // Use integer steps to avoid floating point accumulation errors
+    // Multiply everything by a large factor, iterate as integers, divide back
+    var stepMul = Math.round(1 / subDiv); // e.g. subDiv=0.25 -> stepMul=4
+    var startIdx = Math.floor(startBeat * stepMul);
+    var endIdx = Math.ceil(endBeat * stepMul);
 
-    // Cap marker count to avoid performance issues
     var maxMarkers = Math.ceil(viewWidth / 15) + 20;
     var markerCount = 0;
 
-    for (var pos = snapStart; pos <= endBeat && markerCount < maxMarkers; pos += stepSize) {
-        // Round to avoid floating point errors
-        var beatPos = Math.round(pos * 10000) / 10000;
+    for (var idx = startIdx; idx <= endIdx && markerCount < maxMarkers; idx++) {
+        var beatPos = idx / stepMul;
         if (beatPos < 0) continue;
 
         var xPos = beatPos * timelinePixelsPerBeat;
@@ -1282,25 +1308,18 @@ function renderTimelineRuler() {
         marker.style.position = 'absolute';
         marker.style.left = xPos + 'px';
 
-        var isBar = (Math.abs(beatPos % beatsPerBar) < 0.0001) || (Math.abs(beatPos % beatsPerBar - beatsPerBar) < 0.0001);
-        var isBeat = (Math.abs(beatPos % 1) < 0.0001) || (Math.abs(beatPos % 1 - 1) < 0.0001);
+        // Use integer arithmetic to classify: bar, beat, or sub-beat
+        var beatsPerBarMul = beatsPerBar * stepMul;
+        var isBar = (idx % beatsPerBarMul) === 0;
+        var isBeat = (idx % stepMul) === 0;
 
         if (isBar) {
-            var bar = Math.floor(beatPos / beatsPerBar) + 1;
+            var bar = Math.floor(idx / beatsPerBarMul) + 1;
             marker.className = 'bar-marker';
             marker.textContent = bar;
-        } else if (isBeat) {
-            var beatInBar = Math.round(beatPos % beatsPerBar) + 1;
-            marker.className = 'beat-marker';
-            marker.textContent = '·' + beatInBar;
-        } else {
-            // Sub-beat marker - show as tick
-            marker.className = 'sub-marker';
-            marker.textContent = '·';
+            ruler.appendChild(marker);
+            markerCount++;
         }
-
-        ruler.appendChild(marker);
-        markerCount++;
     }
 }
 
@@ -1415,7 +1434,6 @@ function handleTimelineClick(e) {
     // Click on clip or its children (except handles)
     var clipEl = target.closest('.timeline-clip');
     if (clipEl && !target.classList.contains('clip-loop-handle') &&
-        !target.classList.contains('clip-expand-handle') &&
         !target.classList.contains('clip-resize-handle')) {
         var clipId = parseFloat(clipEl.getAttribute('data-clip-id'));
         var trackId = parseInt(clipEl.getAttribute('data-track-id'));
@@ -1423,14 +1441,44 @@ function handleTimelineClick(e) {
         return;
     }
 
-    // Click on empty track row - just select the track
+    // Click on empty track row or ruler - set playback position
     var row = target.closest('.timeline-track-row');
     if (row) {
         var trackId = parseInt(row.getAttribute('data-track-id'));
         state.selectedTrack = trackId;
         state.focusedTrack = trackId;
         renderTrackList();
+
+        // Set playback position from click
+        setPlayheadFromClick(e);
     }
+}
+
+// Set the playhead position from a click event on the timeline
+function setPlayheadFromClick(e) {
+    var container = document.getElementById('timeline-tracks');
+    if (!container) return;
+
+    var rect = container.getBoundingClientRect();
+    var clickX = e.clientX - rect.left + container.scrollLeft;
+    var beat = clickX / timelinePixelsPerBeat;
+
+    // Snap to grid
+    var snapBeats = state.timeline.gridSnap || 1;
+    beat = Math.round(beat / snapBeats) * snapBeats;
+
+    beat = Math.max(0, beat);
+    state.currentBeat = beat;
+
+    // Show and position the playhead
+    var playhead = document.getElementById('timeline-playhead');
+    if (playhead) {
+        playhead.style.display = 'block';
+        playhead.style.left = (beat * timelinePixelsPerBeat) + 'px';
+    }
+
+    // Update position display
+    updateTimelinePlayhead();
 }
 
 // Split a clip at a specific beat
@@ -1559,7 +1607,98 @@ function handleTimelineContextAction(action) {
                 consoleLog('Deleted clip');
             }
             break;
+        case 'add-piano-roll':
+            addPianoRollToTrack(timelineContextState.trackId, timelineContextState.beat);
+            break;
     }
+}
+
+// ============================================
+// CODE EDITOR CONTEXT MENU
+// ============================================
+
+var codeEditorContextState = {
+    textarea: null,
+    selectionStart: 0,
+    selectionEnd: 0
+};
+
+function handleCodeEditorContextMenu(e) {
+    e.preventDefault();
+
+    var menu = document.getElementById('code-editor-context-menu');
+    if (!menu) return;
+
+    codeEditorContextState.textarea = e.target;
+    codeEditorContextState.selectionStart = e.target.selectionStart;
+    codeEditorContextState.selectionEnd = e.target.selectionEnd;
+
+    menu.style.left = e.clientX + 'px';
+    menu.style.top = e.clientY + 'px';
+    menu.style.display = 'block';
+
+    // Hide on click elsewhere
+    setTimeout(function() {
+        document.addEventListener('click', hideCodeEditorContextMenu, { once: true });
+    }, 0);
+}
+
+function hideCodeEditorContextMenu() {
+    var menu = document.getElementById('code-editor-context-menu');
+    if (menu) menu.style.display = 'none';
+}
+
+function handleCodeEditorContextAction(action) {
+    hideCodeEditorContextMenu();
+
+    if (action === 'insert-sampler') {
+        insertSamplerCode();
+    }
+}
+
+function insertSamplerCode() {
+    var textarea = codeEditorContextState.textarea || document.getElementById('code-editor');
+    if (!textarea) return;
+
+    var samplerCode = `    iSample = 100
+    iLen    = ftlen(iSample)
+
+    ; parameters
+    iFreqHz   = max(p4, 0.001)    ; desired frequency in Hz
+    iOffsetN  = limit(p6, 0, 1)   ; normalized offset 0–1
+    iBaseNote = 60                 ; MIDI note for C-5
+    iBaseFreq = 261.6256           ; Hz for C-5
+
+    ; playback speed ratio
+    iRate = iFreqHz / iBaseFreq
+
+    ; offset in samples
+    iStart = iOffsetN * iLen
+    iEnd   = iLen
+    iDist  = iLen - iStart
+
+    ; compute duration in seconds
+    iDur = iDist / (sr * iRate)
+
+    ; one-shot ramp
+    aPos linseg iStart, iDur, iEnd
+
+    ; table read
+    aSig tab aPos, iSample
+
+    outs aSig, aSig`;
+
+    var pos = codeEditorContextState.selectionStart;
+    var before = textarea.value.substring(0, pos);
+    var after = textarea.value.substring(codeEditorContextState.selectionEnd);
+
+    textarea.value = before + samplerCode + after;
+    textarea.selectionStart = textarea.selectionEnd = pos + samplerCode.length;
+    textarea.focus();
+
+    // Save the instrument
+    saveCurrentInstrument();
+    consoleLog('Inserted sampler code');
 }
 
 function addPatternToTrack(trackId, beat) {
@@ -1579,6 +1718,24 @@ function addPatternToTrack(trackId, beat) {
         renderTimeline();
         selectClip(trackId, clip.id);
         consoleLog('Added pattern to track ' + (trackId + 1));
+    }
+}
+
+function addPianoRollToTrack(trackId, beat) {
+    // Create a new piano roll pattern with default 4 beats
+    var beats = 4;
+    var lpb = state.lpb;
+
+    var pattern = createPianoPattern(beats, lpb, trackId);
+    state.patterns.push(pattern);
+    var patternId = state.patterns.length - 1;
+
+    // Add clip to track
+    var clip = addClipToTrack(trackId, patternId, beat, 1);
+    if (clip) {
+        renderTimeline();
+        selectClip(trackId, clip.id);
+        consoleLog('Added piano roll to track ' + (trackId + 1));
     }
 }
 
@@ -1615,7 +1772,23 @@ function selectClip(trackId, clipId) {
             // Update pattern title display
             updatePatternPianoTitle(trackId, pattern);
             switchEditorView('pattern');
-            renderTrackerGrid(true);
+
+            // Show appropriate editor based on pattern type
+            var trackerContainer = document.getElementById('tracker-container');
+            var pianoContainer = document.getElementById('piano-roll-container');
+
+            if (pattern.type === 'piano') {
+                // Show piano roll, hide tracker
+                if (trackerContainer) trackerContainer.classList.add('hidden');
+                if (pianoContainer) pianoContainer.classList.remove('hidden');
+                updatePianoInstrumentSelector();
+                renderPianoRoll();
+            } else {
+                // Show tracker, hide piano roll
+                if (trackerContainer) trackerContainer.classList.remove('hidden');
+                if (pianoContainer) pianoContainer.classList.add('hidden');
+                renderTrackerGrid(true);
+            }
         }
     }
 
@@ -1625,7 +1798,8 @@ function selectClip(trackId, clipId) {
 function updatePatternPianoTitle(trackId, pattern) {
     var titleEl = document.getElementById('pattern-editor-title');
     if (titleEl) {
-        titleEl.textContent = 'Pattern: ' + (pattern.name || 'Untitled') + ' (Track ' + (trackId + 1) + ')';
+        var patternType = pattern.type === 'piano' ? ' [Piano Roll]' : '';
+        titleEl.textContent = 'Pattern: ' + (pattern.name || 'Untitled') + patternType + ' (Track ' + (trackId + 1) + ')';
     }
 
     // Update pattern controls
@@ -1633,7 +1807,9 @@ function updatePatternPianoTitle(trackId, pattern) {
     var lpbInput = document.getElementById('pattern-lpb');
 
     if (stepsInput) {
-        stepsInput.value = pattern.steps || 16;
+        // For piano patterns, calculate steps from beats
+        var steps = pattern.type === 'piano' ? (pattern.beats * (pattern.lpb || state.lpb)) : (pattern.steps || 16);
+        stepsInput.value = steps;
     }
     if (lpbInput) {
         lpbInput.value = pattern.lpb || state.lpb;
@@ -1785,40 +1961,9 @@ function handleTimelineMouseDown(e) {
         return;
     }
 
-    // Check if clicking on expand handle (mid-left) - changes pattern steps
-    if (target.classList.contains('clip-expand-handle')) {
-        e.preventDefault();
-        var clipEl = target.closest('.timeline-clip');
-        var clipId = parseFloat(clipEl.getAttribute('data-clip-id'));
-        var trackId = parseInt(clipEl.getAttribute('data-track-id'));
-
-        var track = state.tracks[trackId];
-        var clip = null;
-        for (var i = 0; i < track.clips.length; i++) {
-            if (track.clips[i].id === clipId) {
-                clip = track.clips[i];
-                break;
-            }
-        }
-
-        if (clip) {
-            var pattern = state.patterns[clip.patternId];
-            clipDragState.active = true;
-            clipDragState.mode = 'expand';
-            clipDragState.clipId = clipId;
-            clipDragState.trackId = trackId;
-            clipDragState.startX = e.clientX;
-            clipDragState.startSteps = pattern ? pattern.steps : 16;
-            clipDragState.clipElement = clipEl;
-            document.body.style.cursor = 'ew-resize';
-        }
-        return;
-    }
-
     // Check if clicking on clip (for dragging) - but not on handles
     var clipEl = target.closest('.timeline-clip');
     if (clipEl && !target.classList.contains('clip-loop-handle') &&
-        !target.classList.contains('clip-expand-handle') &&
         !target.classList.contains('clip-resize-handle') &&
         !target.classList.contains('clip-split-handle')) {
         e.preventDefault();
@@ -2065,44 +2210,6 @@ function handleTimelineMouseMove(e) {
         var header = clipDragState.clipElement.querySelector('.clip-header');
         if (header) {
             header.textContent = label;
-        }
-
-        autoExtendTimeline();
-    } else if (clipDragState.mode === 'expand') {
-        // Change pattern steps (expand/contract pattern)
-        var pattern = state.patterns[clip.patternId];
-        if (!pattern) return;
-
-        var patternLpb = pattern.lpb || state.lpb;
-
-        // Calculate step change based on grid snap
-        var gridSnap = state.timeline.gridSnap || 1;
-        var stepChange = Math.round(deltaBeat / gridSnap) * (patternLpb * gridSnap);
-        var newSteps = Math.max(patternLpb, clipDragState.startSteps + stepChange);
-
-        // Update pattern steps
-        pattern.steps = newSteps;
-
-        // Ensure pattern data array is correct size
-        while (pattern.data.length < newSteps) {
-            pattern.data.push({ columns: [] });
-        }
-
-        // Update visual width
-        var duration = getClipDurationBeats(clip);
-        clipDragState.clipElement.style.width = (duration * timelinePixelsPerBeat - 2) + 'px';
-
-        // Update note visualization canvas
-        var canvas = clipDragState.clipElement.querySelector('.clip-note-viz');
-        if (canvas) {
-            canvas.width = Math.max(duration * timelinePixelsPerBeat - 2, 1);
-            renderClipNotes(canvas, pattern, clip.loopCount);
-        }
-
-        // Update pattern steps input if visible
-        var stepsInput = document.getElementById('pattern-steps');
-        if (stepsInput && state.selectedClip && state.selectedClip.clipId === clip.id) {
-            stepsInput.value = newSteps;
         }
 
         autoExtendTimeline();
@@ -4390,6 +4497,13 @@ function scheduleClipsAtBeat(beat, scheduledTime) {
         if (!pattern) continue;
 
         var patternLpb = pattern.lpb || state.lpb;
+
+        // Handle piano roll patterns
+        if (pattern.type === 'piano') {
+            schedulePianoNotesAtBeat(trackId, clip, pattern, beat, p2);
+            continue;
+        }
+
         var stepInfo = beatToPatternStep(clip, beat);
         var step = stepInfo.step;
         var loopCount = stepInfo.loopCount;
@@ -4542,6 +4656,83 @@ function scheduleClipsAtBeat(beat, scheduledTime) {
     }
 }
 
+// Track active piano roll voices for note-off scheduling
+var activePianoVoices = {};
+
+function schedulePianoNotesAtBeat(trackId, clip, pattern, beat, p2) {
+    if (!pattern.notes || pattern.notes.length === 0) return;
+
+    // Calculate local beat within the pattern (accounting for clip start and looping)
+    var localBeat = beat - clip.startBeat;
+    var patternBeats = pattern.beats || 4;
+
+    // Handle looping
+    var loopCount = Math.floor(localBeat / patternBeats);
+    localBeat = localBeat % patternBeats;
+    if (localBeat < 0) localBeat += patternBeats;
+
+    // Scheduler step size (in beats) - use max LPB for finest resolution
+    var maxLpb = getMaxLpb() || state.lpb;
+    var schedulerStepBeats = 1 / maxLpb;
+    var tolerance = schedulerStepBeats / 2;
+
+    // Get instrument number for this pattern
+    var instrNum = pattern.instrument || 1;
+
+    // Find notes that start at this beat
+    for (var i = 0; i < pattern.notes.length; i++) {
+        var note = pattern.notes[i];
+
+        // Check if this note should start now (within tolerance)
+        if (Math.abs(note.startBeat - localBeat) < tolerance) {
+            var voiceKey = trackId + '_piano_' + i + '_' + loopCount;
+
+            // Skip if already played in this loop
+            if (activePianoVoices[voiceKey]) continue;
+
+            // Calculate duration in seconds
+            var durationSecs = (note.duration * 60) / state.bpm;
+            var freq = midiNoteToFreq(note.pitch);
+            var amp = note.velocity || 0.5;
+
+            // Create unique instrument instance (string format to avoid float precision issues)
+            voiceCounter++;
+            if (voiceCounter > 999) voiceCounter = 1;
+            var instrInstance = instrNum + '.' + voiceCounter.toString().padStart(3, '0');
+
+            // Schedule note-on
+            var pfields = [instrInstance, p2.toFixed(4), durationSecs.toFixed(4), freq.toFixed(4), amp.toFixed(4)];
+            var msg = 'i ' + pfields.join(' ');
+
+            try {
+                csound.inputMessage(msg);
+                activePianoVoices[voiceKey] = {
+                    instrInstance: instrInstance,
+                    endBeat: beat + note.duration
+                };
+                logVoice('PIANO-ON', voiceKey, { instr: instrInstance, pitch: note.pitch, duration: note.duration });
+            } catch (err) {
+                logVoice('PIANO-ON-ERROR', voiceKey, { error: err.message || err });
+            }
+        }
+    }
+
+    // Clean up expired piano voices
+    var keysToDelete = [];
+    for (var key in activePianoVoices) {
+        if (activePianoVoices[key].endBeat <= beat) {
+            keysToDelete.push(key);
+        }
+    }
+    for (var j = 0; j < keysToDelete.length; j++) {
+        delete activePianoVoices[keysToDelete[j]];
+    }
+}
+
+function midiNoteToFreq(midiNote) {
+    return 440 * Math.pow(2, (midiNote - 69) / 12);
+}
+
 // Get note duration in steps for a specific note column
 function getNoteDurationStepsSingle(pattern, startStep, noteColIndex) {
     // Find the next note or note-off to determine duration
@@ -4624,8 +4815,10 @@ function startPlayback() {
     }
 
     state.isPlaying = true;
-    // Start from loop start if loop is enabled, otherwise from beginning
-    state.currentBeat = state.timeline.loopEnabled ? state.timeline.loopStart : 0;
+    // Use current playhead position if set, otherwise loop start or 0
+    if (state.currentBeat <= 0) {
+        state.currentBeat = state.timeline.loopEnabled ? state.timeline.loopStart : 0;
+    }
     clipLastStep = {};  // Reset clip step tracking
     activeVoices = {};  // Reset active voices
     voiceCounter = 1;  // Reset voice counter
@@ -4696,20 +4889,27 @@ function stopPlayback() {
 
     // Clear active voices tracking
     activeVoices = {};
+    activePianoVoices = {};
     voiceCounter = 1;
+
+    // Clear MIDI recording state
+    midiNoteStartBeats = {};
 
     var rows = document.querySelectorAll('.track-row.playing');
     for (var i = 0; i < rows.length; i++) {
         rows[i].classList.remove('playing');
     }
 
-    // Hide timeline playhead
+    // Keep playhead visible at stopped position so user can resume from there
     var playhead = document.getElementById('timeline-playhead');
-    if (playhead) playhead.style.display = 'none';
+    if (playhead) {
+        playhead.style.display = 'block';
+        playhead.style.left = (state.currentBeat * timelinePixelsPerBeat) + 'px';
+    }
 
     document.getElementById('btn-play').disabled = false;
     // Keep stop button enabled for "panic" functionality (second click kills all notes)
-    consoleLog('Stopped');
+    consoleLog('Stopped at beat ' + state.currentBeat.toFixed(2));
     setStatus('Stopped');
 }
 
@@ -4908,10 +5108,15 @@ function loadSong(file) {
 
             if (songData.ftablePool && songData.ftablePool.length > 0) {
                 songData.ftablePool.forEach(function(item) {
+                    // Ensure fileName has leading slash for Csound WASM filesystem
+                    var fileName = item.fileName || ('/' + (item.name || 'sample_ft' + item.tableNum + '.wav').replace(/[^a-zA-Z0-9._-]/g, '_'));
+                    if (fileName.charAt(0) !== '/') fileName = '/' + fileName;
+
                     state.ftablePool.push({
                         tableNum: item.tableNum,
                         name: item.name,
-                        libraryId: item.libraryId
+                        libraryId: item.libraryId,
+                        fileName: fileName
                     });
 
                     // Restore sample data for Csound
@@ -4919,7 +5124,8 @@ function loadSong(file) {
                         var rawData = base64ToArrayBuffer(item.rawDataB64);
                         state.samples.push({
                             tableNum: item.tableNum,
-                            fileName: item.fileName || ('sample_ft' + item.tableNum + '.wav'),
+                            name: item.name,
+                            fileName: fileName,
                             rawData: rawData,
                             audioBuffer: null
                         });
@@ -5064,15 +5270,20 @@ async function loadDemo(demoNum) {
 
         if (songData.ftablePool && songData.ftablePool.length > 0) {
             songData.ftablePool.forEach(function(item) {
+                var fileName = item.fileName || ('/' + (item.name || 'sample_ft' + item.tableNum + '.wav').replace(/[^a-zA-Z0-9._-]/g, '_'));
+                if (fileName.charAt(0) !== '/') fileName = '/' + fileName;
+
                 state.ftablePool.push({
                     tableNum: item.tableNum,
                     name: item.name,
-                    libraryId: item.libraryId
+                    libraryId: item.libraryId,
+                    fileName: fileName
                 });
                 if (item.rawDataB64) {
                     state.samples.push({
                         tableNum: item.tableNum,
-                        fileName: item.fileName || ('sample_ft' + item.tableNum + '.wav'),
+                        name: item.name,
+                        fileName: fileName,
                         rawData: base64ToArrayBuffer(item.rawDataB64),
                         audioBuffer: null
                     });
@@ -5815,7 +6026,12 @@ async function loadRestoredFtablesIntoCsound() {
         if (!sample.rawData) continue;
 
         try {
-            var fileName = sample.fileName || ('/' + sample.name);
+            // Ensure fileName has leading slash for Csound WASM filesystem
+            var fileName = sample.fileName || ('/' + (sample.name || 'sample_ft' + sample.tableNum + '.wav'));
+            if (fileName.charAt(0) !== '/') fileName = '/' + fileName;
+            // Update the sample's fileName for consistency
+            sample.fileName = fileName;
+
             var fileData = new Uint8Array(sample.rawData);
             await csound.fs.writeFile(fileName, fileData);
 
@@ -6775,16 +6991,17 @@ var pianoRoll = {
     keysContainer: null,
     pixelsPerBeat: 40,
     noteHeight: 16,
-    octaves: 9,  // C-1 to C8
-    lowestNote: 12,  // C0 (MIDI note 12)
-    notes: [],  // Array of { pitch, startBeat, duration, velocity }
-    selectedNotes: [],
+    octaves: 9,  // C0 to C8
+    lowestNote: 24,  // C1 (MIDI note 24)
+    // State for interactions
     isDragging: false,
     dragMode: null,  // 'move', 'resize', 'draw'
     dragStartX: 0,
     dragStartY: 0,
-    scrollX: 0,
-    scrollY: 0
+    dragStartPitch: 0,
+    dragNote: null,
+    dragNoteIndex: -1,
+    originalNoteData: null
 };
 
 function initPianoRoll() {
@@ -6797,7 +7014,7 @@ function initPianoRoll() {
         pianoRoll.canvas.addEventListener('mousedown', handlePianoRollMouseDown);
         pianoRoll.canvas.addEventListener('mousemove', handlePianoRollMouseMove);
         pianoRoll.canvas.addEventListener('mouseup', handlePianoRollMouseUp);
-        pianoRoll.canvas.addEventListener('dblclick', handlePianoRollDblClick);
+        pianoRoll.canvas.addEventListener('mouseleave', handlePianoRollMouseUp);
         pianoRoll.canvas.addEventListener('contextmenu', handlePianoRollContextMenu);
     }
 
@@ -6809,8 +7026,9 @@ function initPianoRoll() {
     var quantizeSelect = document.getElementById('piano-quantize');
     if (quantizeSelect) {
         quantizeSelect.addEventListener('change', function() {
-            state.quantize = this.value;
+            pianoRoll.quantize = parseFloat(this.value) || 0.25;
         });
+        pianoRoll.quantize = parseFloat(quantizeSelect.value) || 0.25;
     }
 
     // Zoom buttons
@@ -6819,14 +7037,62 @@ function initPianoRoll() {
     if (btnZoomIn) btnZoomIn.addEventListener('click', function() { zoomPianoRoll(1.25); });
     if (btnZoomOut) btnZoomOut.addEventListener('click', function() { zoomPianoRoll(0.8); });
 
+    // Instrument selector
+    var instrSelect = document.getElementById('piano-instrument');
+    if (instrSelect) {
+        instrSelect.addEventListener('change', function() {
+            var pattern = getCurrentPattern();
+            if (pattern && pattern.type === 'piano') {
+                pattern.instrument = parseInt(this.value) || 1;
+            }
+        });
+    }
+
     renderPianoKeys();
+}
+
+// Update piano roll instrument selector with available instruments
+function updatePianoInstrumentSelector() {
+    var select = document.getElementById('piano-instrument');
+    if (!select) return;
+
+    var pattern = getCurrentPattern();
+    var currentInstr = (pattern && pattern.instrument) ? pattern.instrument : 1;
+
+    select.innerHTML = '';
+
+    // Add all available instruments (1-128, but show ftable names if available)
+    for (var i = 1; i <= 16; i++) {
+        var option = document.createElement('option');
+        option.value = i;
+
+        // Check if there's an ftable with this number
+        var ftable = null;
+        for (var j = 0; j < state.ftablePool.length; j++) {
+            if (state.ftablePool[j].tableNum === i) {
+                ftable = state.ftablePool[j];
+                break;
+            }
+        }
+
+        if (ftable && ftable.name) {
+            option.textContent = i + ': ' + ftable.name;
+        } else {
+            option.textContent = i + ': Synth ' + i;
+        }
+
+        if (i === currentInstr) {
+            option.selected = true;
+        }
+
+        select.appendChild(option);
+    }
 }
 
 function renderPianoKeys() {
     if (!pianoRoll.keysContainer) return;
     pianoRoll.keysContainer.innerHTML = '';
 
-    // Render from high to low (C8 to C0)
     var totalNotes = pianoRoll.octaves * 12;
     for (var i = totalNotes - 1; i >= 0; i--) {
         var noteNum = pianoRoll.lowestNote + i;
@@ -6858,18 +7124,42 @@ function renderPianoKeys() {
     }
 }
 
+// Get notes array from current pattern (single source of truth)
+function getPianoNotes() {
+    var pattern = getCurrentPattern();
+    if (pattern && pattern.type === 'piano') {
+        return pattern.notes || [];
+    }
+    return [];
+}
+
+// Get pattern beats
+function getPianoPatternBeats() {
+    var pattern = getCurrentPattern();
+    if (!pattern) return 4;
+    if (pattern.type === 'piano') {
+        return pattern.beats || 4;
+    }
+    return (pattern.steps || 16) / (pattern.lpb || state.lpb);
+}
+
 function renderPianoRoll() {
     if (!pianoRoll.canvas || !pianoRoll.ctx) return;
 
     var pattern = getCurrentPattern();
-    if (!pattern) return;
+    if (!pattern || pattern.type !== 'piano') {
+        // Clear canvas if no piano pattern
+        pianoRoll.ctx.fillStyle = '#1a1a2e';
+        pianoRoll.ctx.fillRect(0, 0, pianoRoll.canvas.width, pianoRoll.canvas.height);
+        return;
+    }
 
+    var patternBeats = pattern.beats || 4;
     var patternLpb = pattern.lpb || state.lpb;
-    var patternBeats = pattern.steps / patternLpb;
     var totalNotes = pianoRoll.octaves * 12;
 
     // Size canvas
-    var width = patternBeats * pianoRoll.pixelsPerBeat;
+    var width = Math.max(400, patternBeats * pianoRoll.pixelsPerBeat);
     var height = totalNotes * pianoRoll.noteHeight;
     pianoRoll.canvas.width = width;
     pianoRoll.canvas.height = height;
@@ -6880,119 +7170,107 @@ function renderPianoRoll() {
     ctx.fillStyle = '#1a1a2e';
     ctx.fillRect(0, 0, width, height);
 
-    // Draw grid
-    ctx.strokeStyle = '#0f3460';
-    ctx.lineWidth = 1;
-
-    // Horizontal lines (note rows)
-    for (var i = 0; i <= totalNotes; i++) {
+    // Draw horizontal lines and row backgrounds
+    for (var i = 0; i < totalNotes; i++) {
         var y = i * pianoRoll.noteHeight;
-        var noteNum = pianoRoll.lowestNote + (totalNotes - i);
+        var noteNum = pianoRoll.lowestNote + (totalNotes - i - 1);
         var isBlack = [1, 3, 6, 8, 10].indexOf(noteNum % 12) !== -1;
 
-        // Darker background for black keys
+        // Alternate row colors
         if (isBlack) {
             ctx.fillStyle = '#12122a';
             ctx.fillRect(0, y, width, pianoRoll.noteHeight);
         }
 
+        // Row line
+        ctx.strokeStyle = '#0f3460';
+        ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.moveTo(0, y);
         ctx.lineTo(width, y);
         ctx.stroke();
     }
 
-    // Vertical lines (beat/step grid)
+    // Draw vertical grid lines
     var stepsPerBeat = patternLpb;
-    for (var step = 0; step <= pattern.steps; step++) {
-        var x = (step / patternLpb) * pianoRoll.pixelsPerBeat;
-        ctx.strokeStyle = (step % stepsPerBeat === 0) ? '#16213e' : '#0f3460';
+    var totalSteps = patternBeats * stepsPerBeat;
+    for (var step = 0; step <= totalSteps; step++) {
+        var x = (step / stepsPerBeat) * pianoRoll.pixelsPerBeat;
+        var isBeat = step % stepsPerBeat === 0;
+        var isBar = step % (stepsPerBeat * 4) === 0;
+
+        ctx.strokeStyle = isBar ? '#2a4a7a' : (isBeat ? '#1a3a5a' : '#0f3460');
+        ctx.lineWidth = isBar ? 2 : 1;
         ctx.beginPath();
         ctx.moveTo(x, 0);
         ctx.lineTo(x, height);
         ctx.stroke();
     }
 
-    // Draw notes from piano roll data
-    ctx.fillStyle = '#4ecca3';
-    for (var i = 0; i < pianoRoll.notes.length; i++) {
-        var note = pianoRoll.notes[i];
-        drawPianoNote(ctx, note);
-    }
-
-    // Also draw notes from step sequencer data (if any)
-    var trackIdx = state.selectedTrack;
-    if (pattern.data && pattern.data[trackIdx]) {
-        for (var step = 0; step < pattern.steps; step++) {
-            var stepData = pattern.data[trackIdx][step];
-            if (stepData && stepData.notes) {
-                for (var nc = 0; nc < stepData.notes.length; nc++) {
-                    var noteData = stepData.notes[nc];
-                    if (noteData.note && noteData.note !== '' && noteData.note !== NOTE_OFF) {
-                        var midiNote = noteNameToMidi(noteData.note);
-                        if (midiNote >= pianoRoll.lowestNote) {
-                            var noteObj = {
-                                pitch: midiNote,
-                                startBeat: step / patternLpb,
-                                duration: 1 / patternLpb,
-                                velocity: parseAmplitude(noteData.amp)
-                            };
-                            drawPianoNote(ctx, noteObj, '#6c63ff');
-                        }
-                    }
-                }
-            }
-        }
+    // Draw notes from pattern
+    var notes = pattern.notes || [];
+    for (var i = 0; i < notes.length; i++) {
+        var note = notes[i];
+        var isSelected = pianoRoll.dragNote === note;
+        drawPianoNote(ctx, note, isSelected);
     }
 
     renderVelocityLane();
 }
 
-function drawPianoNote(ctx, note, color) {
+function drawPianoNote(ctx, note, isSelected) {
     var totalNotes = pianoRoll.octaves * 12;
-    var y = (totalNotes - (note.pitch - pianoRoll.lowestNote) - 1) * pianoRoll.noteHeight;
-    var x = note.startBeat * pianoRoll.pixelsPerBeat;
-    var w = note.duration * pianoRoll.pixelsPerBeat;
+    var noteRow = totalNotes - (note.pitch - pianoRoll.lowestNote) - 1;
 
-    ctx.fillStyle = color || '#4ecca3';
+    if (noteRow < 0 || noteRow >= totalNotes) return;  // Out of range
+
+    var y = noteRow * pianoRoll.noteHeight;
+    var x = note.startBeat * pianoRoll.pixelsPerBeat;
+    var w = Math.max(4, note.duration * pianoRoll.pixelsPerBeat);
+
+    // Note fill
+    var velocity = note.velocity || 0.8;
+    var brightness = Math.floor(velocity * 60 + 40);
+    ctx.fillStyle = isSelected ? '#ff9f43' : 'hsl(160, 60%, ' + brightness + '%)';
     ctx.fillRect(x + 1, y + 1, w - 2, pianoRoll.noteHeight - 2);
 
-    // Border
-    ctx.strokeStyle = 'rgba(0,0,0,0.3)';
+    // Note border
+    ctx.strokeStyle = isSelected ? '#fff' : 'rgba(0,0,0,0.4)';
+    ctx.lineWidth = isSelected ? 2 : 1;
     ctx.strokeRect(x + 1, y + 1, w - 2, pianoRoll.noteHeight - 2);
+
+    // Resize handle indicator (right edge)
+    ctx.fillStyle = 'rgba(255,255,255,0.3)';
+    ctx.fillRect(x + w - 5, y + 1, 4, pianoRoll.noteHeight - 2);
 }
 
 function renderVelocityLane() {
     if (!pianoRoll.velocityCanvas || !pianoRoll.velocityCtx) return;
 
     var pattern = getCurrentPattern();
-    if (!pattern) return;
+    if (!pattern || pattern.type !== 'piano') return;
 
-    var patternLpb = pattern.lpb || state.lpb;
-    var patternBeats = pattern.steps / patternLpb;
-
+    var patternBeats = pattern.beats || 4;
     var canvas = pianoRoll.velocityCanvas;
     var ctx = pianoRoll.velocityCtx;
 
-    // Match width to piano roll
-    canvas.width = patternBeats * pianoRoll.pixelsPerBeat;
+    canvas.width = Math.max(400, patternBeats * pianoRoll.pixelsPerBeat);
     canvas.height = 60;
 
     ctx.fillStyle = '#12122a';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // Draw velocity bars
-    for (var i = 0; i < pianoRoll.notes.length; i++) {
-        var note = pianoRoll.notes[i];
+    // Draw velocity bars for each note
+    var notes = pattern.notes || [];
+    for (var i = 0; i < notes.length; i++) {
+        var note = notes[i];
         var x = note.startBeat * pianoRoll.pixelsPerBeat;
-        var h = (note.velocity || 0.7) * 50;
+        var h = (note.velocity || 0.8) * 50;
 
         ctx.fillStyle = '#4ecca3';
-        ctx.fillRect(x + 2, 60 - h, 6, h);
+        ctx.fillRect(x + 2, 60 - h, 8, h);
     }
 }
-
-
 
 function midiToNoteName(midiNote) {
     var octave = Math.floor(midiNote / 12) - 1;
@@ -7000,30 +7278,121 @@ function midiToNoteName(midiNote) {
     return noteNames[noteIdx] + '-' + octave;
 }
 
+// Find note at canvas position
+function findPianoNoteAt(x, y) {
+    var pattern = getCurrentPattern();
+    if (!pattern || pattern.type !== 'piano') return { note: null, index: -1, edge: false };
+
+    var notes = pattern.notes || [];
+    var totalNotes = pianoRoll.octaves * 12;
+    var clickBeat = x / pianoRoll.pixelsPerBeat;
+    var clickRow = Math.floor(y / pianoRoll.noteHeight);
+    var clickPitch = pianoRoll.lowestNote + (totalNotes - clickRow - 1);
+
+    for (var i = notes.length - 1; i >= 0; i--) {  // Check from top (last drawn)
+        var note = notes[i];
+        if (note.pitch !== clickPitch) continue;
+
+        var noteStart = note.startBeat;
+        var noteEnd = note.startBeat + note.duration;
+
+        if (clickBeat >= noteStart && clickBeat <= noteEnd) {
+            var noteEndX = noteEnd * pianoRoll.pixelsPerBeat;
+            var isNearRightEdge = Math.abs(x - noteEndX) < 10;
+            return { note: note, index: i, edge: isNearRightEdge };
+        }
+    }
+
+    return { note: null, index: -1, edge: false };
+}
+
 function handlePianoRollMouseDown(e) {
+    if (e.button !== 0) return;  // Left click only
+
     var rect = pianoRoll.canvas.getBoundingClientRect();
     var x = e.clientX - rect.left;
     var y = e.clientY - rect.top;
+
+    var pattern = getCurrentPattern();
+    if (!pattern || pattern.type !== 'piano') return;
+
+    var found = findPianoNoteAt(x, y);
 
     pianoRoll.isDragging = true;
     pianoRoll.dragStartX = x;
     pianoRoll.dragStartY = y;
 
-    // Check if clicking on existing note
-    var clickedNote = findNoteAt(x, y);
-    if (clickedNote) {
-        pianoRoll.selectedNotes = [clickedNote];
-        pianoRoll.dragMode = 'move';
+    if (found.note) {
+        pianoRoll.dragNote = found.note;
+        pianoRoll.dragNoteIndex = found.index;
+        pianoRoll.originalNoteData = {
+            startBeat: found.note.startBeat,
+            duration: found.note.duration,
+            pitch: found.note.pitch
+        };
+
+        if (found.edge) {
+            pianoRoll.dragMode = 'resize';
+            pianoRoll.canvas.style.cursor = 'ew-resize';
+        } else {
+            pianoRoll.dragMode = 'move';
+            pianoRoll.canvas.style.cursor = 'grabbing';
+        }
     } else {
         pianoRoll.dragMode = 'draw';
+        pianoRoll.dragNote = null;
+        pianoRoll.dragNoteIndex = -1;
     }
 
     renderPianoRoll();
 }
 
 function handlePianoRollMouseMove(e) {
-    if (!pianoRoll.isDragging) return;
-    // Drag handling will be implemented for note movement
+    var rect = pianoRoll.canvas.getBoundingClientRect();
+    var x = e.clientX - rect.left;
+    var y = e.clientY - rect.top;
+
+    var pattern = getCurrentPattern();
+    if (!pattern || pattern.type !== 'piano') return;
+
+    // Update cursor when not dragging
+    if (!pianoRoll.isDragging) {
+        var found = findPianoNoteAt(x, y);
+        if (found.note) {
+            pianoRoll.canvas.style.cursor = found.edge ? 'ew-resize' : 'pointer';
+        } else {
+            pianoRoll.canvas.style.cursor = 'crosshair';
+        }
+        return;
+    }
+
+    var quantize = pianoRoll.quantize || 0.25;
+    var totalNotes = pianoRoll.octaves * 12;
+
+    if (pianoRoll.dragMode === 'resize' && pianoRoll.dragNote) {
+        // Resize note duration
+        var newEndBeat = x / pianoRoll.pixelsPerBeat;
+        var newDuration = newEndBeat - pianoRoll.dragNote.startBeat;
+        newDuration = Math.max(quantize, Math.round(newDuration / quantize) * quantize);
+        pianoRoll.dragNote.duration = newDuration;
+        renderPianoRoll();
+    } else if (pianoRoll.dragMode === 'move' && pianoRoll.dragNote) {
+        // Move note position and pitch
+        var deltaX = x - pianoRoll.dragStartX;
+        var deltaY = y - pianoRoll.dragStartY;
+
+        var deltaBeat = deltaX / pianoRoll.pixelsPerBeat;
+        var newStart = pianoRoll.originalNoteData.startBeat + deltaBeat;
+        newStart = Math.max(0, Math.round(newStart / quantize) * quantize);
+
+        var deltaRows = Math.round(deltaY / pianoRoll.noteHeight);
+        var newPitch = pianoRoll.originalNoteData.pitch - deltaRows;
+        newPitch = Math.max(pianoRoll.lowestNote, Math.min(pianoRoll.lowestNote + totalNotes - 1, newPitch));
+
+        pianoRoll.dragNote.startBeat = newStart;
+        pianoRoll.dragNote.pitch = newPitch;
+        renderPianoRoll();
+    }
 }
 
 function handlePianoRollMouseUp(e) {
@@ -7033,103 +7402,72 @@ function handlePianoRollMouseUp(e) {
     var x = e.clientX - rect.left;
     var y = e.clientY - rect.top;
 
-    if (pianoRoll.dragMode === 'draw') {
+    var pattern = getCurrentPattern();
+
+    if (pianoRoll.dragMode === 'draw' && pattern && pattern.type === 'piano') {
+        // Create new note
+        var quantize = pianoRoll.quantize || 0.25;
         var totalNotes = pianoRoll.octaves * 12;
 
         var beat = x / pianoRoll.pixelsPerBeat;
-        var pitch = pianoRoll.lowestNote + totalNotes - Math.floor(y / pianoRoll.noteHeight) - 1;
+        beat = Math.max(0, Math.floor(beat / quantize) * quantize);
 
-        // Quantize
-        var quantizedBeat = quantizeBeat(beat);
-        var quantizedDuration = getQuantizeDuration();
+        var row = Math.floor(y / pianoRoll.noteHeight);
+        var pitch = pianoRoll.lowestNote + (totalNotes - row - 1);
 
-        var newNote = {
-            pitch: pitch,
-            startBeat: quantizedBeat,
-            duration: quantizedDuration,
-            velocity: 0.8
-        };
+        if (pitch >= pianoRoll.lowestNote && pitch < pianoRoll.lowestNote + totalNotes) {
+            var newNote = {
+                pitch: pitch,
+                startBeat: beat,
+                duration: quantize,
+                velocity: 0.8
+            };
 
-        // Add to piano roll notes array (for display)
-        pianoRoll.notes.push(newNote);
+            if (!pattern.notes) pattern.notes = [];
+            pattern.notes.push(newNote);
 
-        // Save to the current piano pattern if one is selected
-        savePianoNotesToPattern();
-
-        // Preview the note
-        previewMidiNote(pitch, Math.floor(newNote.velocity * 127));
-    }
-
-    pianoRoll.isDragging = false;
-    pianoRoll.dragMode = null;
-    renderPianoRoll();
-}
-
-// Get the currently selected piano pattern (from selected clip)
-function getCurrentPianoPattern() {
-    var track = state.tracks[state.selectedTrack];
-    if (!track || !track.clips) return null;
-
-    // Find selected clip
-    var selectedClipEl = document.querySelector('.timeline-clip.selected');
-    if (!selectedClipEl) return null;
-
-    var clipId = parseFloat(selectedClipEl.getAttribute('data-clip-id'));
-    for (var i = 0; i < track.clips.length; i++) {
-        if (track.clips[i].id === clipId) {
-            var pattern = state.patterns[track.clips[i].patternId];
-            if (pattern && pattern.type === 'piano') {
-                return pattern;
+            // Preview the note
+            previewMidiNote(pitch, Math.floor(newNote.velocity * 127));
+        }
+    } else if (pianoRoll.dragMode === 'resize' || pianoRoll.dragMode === 'move') {
+        // Auto-extend pattern if note goes beyond
+        if (pianoRoll.dragNote && pattern) {
+            var noteEnd = pianoRoll.dragNote.startBeat + pianoRoll.dragNote.duration;
+            if (noteEnd > pattern.beats) {
+                pattern.beats = Math.ceil(noteEnd);
+                renderTimeline();
             }
         }
     }
-    return null;
-}
 
-// Save piano roll notes to the current pattern
-function savePianoNotesToPattern() {
-    var pattern = getCurrentPianoPattern();
-    if (pattern) {
-        pattern.notes = pianoRoll.notes.slice();  // Copy notes array
-    }
-}
+    // Reset drag state
+    pianoRoll.isDragging = false;
+    pianoRoll.dragMode = null;
+    pianoRoll.dragNote = null;
+    pianoRoll.dragNoteIndex = -1;
+    pianoRoll.originalNoteData = null;
+    pianoRoll.canvas.style.cursor = 'crosshair';
 
-function handlePianoRollDblClick(e) {
-    var rect = pianoRoll.canvas.getBoundingClientRect();
-    var x = e.clientX - rect.left;
-    var y = e.clientY - rect.top;
-
-    // Double-click on note to delete
-    var note = findNoteAt(x, y);
-    if (note) {
-        var idx = pianoRoll.notes.indexOf(note);
-        if (idx !== -1) {
-            pianoRoll.notes.splice(idx, 1);
-            savePianoNotesToPattern();
-            renderPianoRoll();
-        }
-    }
+    renderPianoRoll();
 }
 
 function handlePianoRollContextMenu(e) {
     e.preventDefault();
-    // Could show quantize menu here
-}
 
-function findNoteAt(x, y) {
-    var totalNotes = pianoRoll.octaves * 12;
-    var clickPitch = pianoRoll.lowestNote + totalNotes - Math.floor(y / pianoRoll.noteHeight) - 1;
-    var clickBeat = x / pianoRoll.pixelsPerBeat;
+    var rect = pianoRoll.canvas.getBoundingClientRect();
+    var x = e.clientX - rect.left;
+    var y = e.clientY - rect.top;
 
-    for (var i = 0; i < pianoRoll.notes.length; i++) {
-        var note = pianoRoll.notes[i];
-        if (note.pitch === clickPitch &&
-            clickBeat >= note.startBeat &&
-            clickBeat < note.startBeat + note.duration) {
-            return note;
-        }
+    var pattern = getCurrentPattern();
+    if (!pattern || pattern.type !== 'piano') return;
+
+    var found = findPianoNoteAt(x, y);
+    if (found.note && found.index !== -1) {
+        // Delete the note
+        pattern.notes.splice(found.index, 1);
+        renderPianoRoll();
+        consoleLog('Deleted note ' + midiToNoteName(found.note.pitch));
     }
-    return null;
 }
 
 function quantizeBeat(beat) {
@@ -7195,8 +7533,12 @@ function previewMidiNote(midiNote, velocity) {
     var amp = velocity / 127;
     var trackKey = state.selectedTrack;
 
-    // Use unique fractional instance per MIDI note: trackNum.midiNote (e.g., 1.60 for middle C)
-    var instrNum = (state.selectedTrack + 1) + '.' + midiNote.toString().padStart(3, '0');
+    // Get instrument from current pattern, or default to track+1
+    var pattern = getCurrentPattern();
+    var baseInstr = (pattern && pattern.instrument) ? pattern.instrument : (state.selectedTrack + 1);
+
+    // Use unique fractional instance per MIDI note: instrNum.midiNote (e.g., 1.060 for middle C)
+    var instrNum = baseInstr + '.' + midiNote.toString().padStart(3, '0');
 
     // Turn off any existing note on this MIDI key first
     if (activeMidiPreviews[trackKey + '_' + midiNote]) {
@@ -7236,6 +7578,7 @@ function stopMidiNote(midiNote) {
 var midiAccess = null;
 var activeMidiInput = null;
 var midiNoteVelocities = {};  // Track note velocities for recording
+var midiNoteStartBeats = {};  // Track note start beats for piano roll recording
 
 function initMIDI() {
     if (!navigator.requestMIDIAccess) {
@@ -7351,31 +7694,60 @@ function handleMIDINoteOn(note, velocity, channel) {
 
     // Record if recording is enabled
     if (state.isRecording) {
-        var noteName = midiToNoteName(note);
-        var ampHex = Math.round(velocity / 127 * 127).toString(16).toUpperCase().padStart(2, '0');
-        var noteCol = state.focusedNoteCol || 0;
-
-        // Record to step sequencer
         var pattern = getCurrentPattern();
-        var step = state.focusedStep;
 
-        if (pattern && step < pattern.steps) {
-            var stepData = pattern.data[step];
-            if (stepData && stepData.columns) {
-                // Ensure note column exists
-                while (stepData.columns.length <= noteCol) {
-                    stepData.columns.push({ note: '', amp: '', fx: [] });
+        // Check if current pattern is a piano roll
+        if (pattern && pattern.type === 'piano') {
+            // Record to piano roll - track start time
+            var quantizeBeats = 0.25;  // 1/16 note
+            var startBeat;
+
+            if (state.isPlaying) {
+                // Use current playback position
+                startBeat = Math.round(state.currentBeat / quantizeBeats) * quantizeBeats;
+                // Get position relative to the clip
+                var clip = getSelectedClip();
+                if (clip) {
+                    startBeat = startBeat - clip.startBeat;
                 }
-                var colData = stepData.columns[noteCol];
-                colData.note = noteName;
-                colData.amp = ampHex;
+            } else {
+                // Not playing - use end of existing notes or start of pattern
+                if (pattern.notes.length > 0) {
+                    startBeat = Math.max.apply(null, pattern.notes.map(function(n) { return n.startBeat + n.duration; }));
+                } else {
+                    startBeat = 0;
+                }
+                startBeat = Math.round(startBeat / quantizeBeats) * quantizeBeats;
+            }
 
-                invalidatePatternCache(getCurrentPatternIndex());
-                renderTrackerGrid(true);
+            midiNoteStartBeats[note] = {
+                beat: startBeat,
+                velocity: velocity,
+                startTime: performance.now()
+            };
+        } else if (pattern && pattern.data) {
+            // Record to tracker pattern
+            var noteName = midiToNoteName(note);
+            var ampHex = Math.round(velocity / 127 * 255).toString(16).toUpperCase().padStart(2, '0');
+            var noteCol = state.focusedNoteCol || 0;
+            var step = state.focusedStep;
 
-                // Move cursor by edit step
-                if (state.editStep > 0) {
-                    state.focusedStep = Math.min(state.focusedStep + state.editStep, pattern.steps - 1);
+            if (step < pattern.steps) {
+                var stepData = pattern.data[step];
+                if (stepData && stepData.columns) {
+                    while (stepData.columns.length <= noteCol) {
+                        stepData.columns.push({ note: '', amp: '', fx: [] });
+                    }
+                    var colData = stepData.columns[noteCol];
+                    colData.note = noteName;
+                    colData.amp = ampHex;
+
+                    invalidatePatternCache(getCurrentPatternIndex());
+                    renderTrackerGrid(true);
+
+                    if (state.editStep > 0) {
+                        state.focusedStep = Math.min(state.focusedStep + state.editStep, pattern.steps - 1);
+                    }
                 }
             }
         }
@@ -7389,6 +7761,64 @@ function handleMIDINoteOn(note, velocity, channel) {
 function handleMIDINoteOff(note, channel) {
     delete midiNoteVelocities[note];
     stopMidiNote(note);
+
+    // Complete piano roll recording if we have a start beat tracked
+    if (midiNoteStartBeats[note] && state.isRecording) {
+        var startInfo = midiNoteStartBeats[note];
+        var pattern = getCurrentPattern();
+
+        if (pattern && pattern.type === 'piano') {
+            var quantizeBeats = 0.25;  // 1/16 note
+            var duration;
+
+            if (state.isPlaying) {
+                // Calculate duration from playback position
+                var clip = getSelectedClip();
+                var currentRelativeBeat = clip ? state.currentBeat - clip.startBeat : state.currentBeat;
+                var endBeat = Math.round(currentRelativeBeat / quantizeBeats) * quantizeBeats;
+                duration = Math.max(quantizeBeats, endBeat - startInfo.beat);
+            } else {
+                // Calculate duration from elapsed time
+                var elapsedMs = performance.now() - startInfo.startTime;
+                var elapsedBeats = (elapsedMs / 1000) * (state.bpm / 60);
+                duration = Math.max(quantizeBeats, Math.round(elapsedBeats / quantizeBeats) * quantizeBeats);
+            }
+
+            var noteEndBeat = startInfo.beat + duration;
+
+            // Auto-extend pattern if note goes beyond pattern length
+            if (noteEndBeat > pattern.beats) {
+                var newBeats = Math.ceil(noteEndBeat / 4) * 4;  // Round up to nearest 4 beats
+                pattern.beats = newBeats;
+                consoleLog('Extended pattern to ' + newBeats + ' beats');
+
+                // Update clip duration if needed
+                var clip = getSelectedClip();
+                if (clip) {
+                    var patternBeats = pattern.beats;
+                    var newLoopCount = Math.ceil(noteEndBeat / patternBeats);
+                    if (newLoopCount > clip.loopCount) {
+                        clip.loopCount = newLoopCount;
+                    }
+                    renderTimeline();
+                }
+            }
+
+            // Add note to pattern
+            if (!pattern.notes) pattern.notes = [];
+            pattern.notes.push({
+                pitch: note,
+                startBeat: startInfo.beat,
+                duration: duration,
+                velocity: startInfo.velocity / 127
+            });
+
+            renderPianoRoll();
+            consoleLog('Recorded note ' + midiToNoteName(note) + ' at beat ' + startInfo.beat.toFixed(2));
+        }
+
+        delete midiNoteStartBeats[note];
+    }
 
     // Visual feedback
     var key = document.querySelector('.piano-key[data-note="' + note + '"]');
@@ -9333,6 +9763,27 @@ function init() {
         timelineTracks.addEventListener('contextmenu', handleTimelineContextMenu);
         timelineTracks.addEventListener('mousedown', handleTimelineMouseDown);
 
+        // Click on ruler to set playback position
+        var rulerEl = document.getElementById('timeline-ruler');
+        if (rulerEl) {
+            rulerEl.addEventListener('click', function(e) {
+                var header = rulerEl.closest('.timeline-header');
+                var scrollLeft = header ? header.scrollLeft : 0;
+                var rect = rulerEl.getBoundingClientRect();
+                var clickX = e.clientX - rect.left + scrollLeft;
+                var beat = clickX / timelinePixelsPerBeat;
+                var snapBeats = state.timeline.gridSnap || 1;
+                beat = Math.max(0, Math.round(beat / snapBeats) * snapBeats);
+                state.currentBeat = beat;
+                var playhead = document.getElementById('timeline-playhead');
+                if (playhead) {
+                    playhead.style.display = 'block';
+                    playhead.style.left = (beat * timelinePixelsPerBeat) + 'px';
+                }
+                updateTimelinePlayhead();
+            });
+        }
+
         // Synchronize track list scroll with timeline scroll
         var trackList = document.getElementById('track-list');
         var timelineHeader = document.querySelector('.timeline-header');
@@ -9429,6 +9880,9 @@ function init() {
         if (!e.target.closest('#timeline-context-menu')) {
             hideTimelineContextMenu();
         }
+        if (!e.target.closest('#code-editor-context-menu')) {
+            hideCodeEditorContextMenu();
+        }
     });
 
     document.getElementById('btn-compile').addEventListener('click', compileInstruments);
@@ -9477,6 +9931,13 @@ function init() {
 
     document.getElementById('code-editor').addEventListener('blur', saveCurrentInstrument);
     document.getElementById('opcodes-editor').addEventListener('blur', saveOpcodes);
+
+    // Code editor context menu
+    document.getElementById('code-editor').addEventListener('contextmenu', handleCodeEditorContextMenu);
+    document.getElementById('code-editor-context-menu').addEventListener('click', function(e) {
+        var action = e.target.getAttribute('data-action');
+        if (action) handleCodeEditorContextAction(action);
+    });
 
     consoleLog('Keys: z-]/q-]=notes, Arrows=nav, Tab=OFF, `=rec, Ctrl+C/X/V=copy/cut/paste');
 
