@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Csound Mod Tracker</title>
     <link rel="stylesheet" href="styles.css">
 </head>
@@ -10,19 +10,42 @@
     <div id="app">
         <header>
             <div class="header-top">
-                <div class="file-controls">
-                    <button id="btn-save" title="Save Song (Ctrl+S)">Save</button>
-                    <button id="btn-load" title="Load Song (Ctrl+O)">Load</button>
-                    <button id="btn-export-csd" title="Export as Csound CSD">Export CSD</button>
-                    <input type="file" id="file-input" accept=".cst" style="display:none">
+                <div class="menu-bar">
+                    <div class="dropdown">
+                        <button class="dropdown-toggle">File</button>
+                        <div class="dropdown-menu">
+                            <div class="dropdown-item" id="menu-new">New</div>
+                            <div class="dropdown-item" id="menu-save">Save (Ctrl+S)</div>
+                            <div class="dropdown-item" id="menu-save-as">Save As...</div>
+                            <div class="dropdown-item" id="menu-load">Load (Ctrl+O)</div>
+                            <div class="dropdown-separator"></div>
+                            <div class="dropdown-item" id="menu-export-csd">Export CSD</div>
+                        </div>
+                    </div>
+                    <div class="dropdown">
+                        <button class="dropdown-toggle">Edit</button>
+                        <div class="dropdown-menu">
+                            <div class="dropdown-item" id="menu-undo">Undo (Ctrl+Z)</div>
+                            <div class="dropdown-item" id="menu-redo">Redo (Ctrl+Y)</div>
+                            <div class="dropdown-separator"></div>
+                            <div class="dropdown-item" id="menu-cut">Cut (Ctrl+X)</div>
+                            <div class="dropdown-item" id="menu-copy">Copy (Ctrl+C)</div>
+                            <div class="dropdown-item" id="menu-paste">Paste (Ctrl+V)</div>
+                            <div class="dropdown-separator"></div>
+                            <div class="dropdown-item" id="menu-select-all">Select All (Ctrl+A)</div>
+                        </div>
+                    </div>
                 </div>
                 <div class="demo-controls">
-                    <span class="demo-label">Demos:</span>
-                    <button class="demo-btn" data-demo="1">1</button>
-                    <button class="demo-btn" data-demo="2">2</button>
-                    <button class="demo-btn" data-demo="3">3</button>
-                    <button class="demo-btn" data-demo="4">4</button>
+                    <span class="demo-label">Demos</span>
+                    <div class="demo-buttons-group">
+                        <button class="demo-btn" data-demo="1">Demo 1</button>
+                        <button class="demo-btn" data-demo="2">Demo 2</button>
+                        <button class="demo-btn" data-demo="3">Demo 3</button>
+                        <button class="demo-btn" data-demo="4">Demo 4</button>
+                    </div>
                 </div>
+                <input type="file" id="file-input" accept=".cst" style="display:none">
             </div>
             <div class="transport-controls">
                 <button id="btn-play" disabled title="Play (Space)">&#9658;</button>
@@ -60,58 +83,73 @@
         <div class="main-container">
             <!-- Center Panel (Track Layout + Pattern Editor) -->
             <div class="center-panel">
-                <!-- Track Layout Area (Track Sidebar + Timeline) -->
-                <div class="track-layout-area">
-                    <!-- Track List Sidebar (DAW-style) -->
-                    <div class="track-sidebar">
-                        <div class="track-sidebar-header">
-                            <span>Tracks</span>
-                            <div class="track-sidebar-buttons">
-                                <button id="btn-add-track" title="Add Track">+</button>
-                                <button id="btn-remove-track" title="Remove Track">-</button>
-                                <button id="btn-scroll-tracks-up" title="Scroll Up">&#9650;</button>
-                                <button id="btn-scroll-tracks-down" title="Scroll Down">&#9660;</button>
-                            </div>
-                        </div>
-                        <div id="track-list" class="track-list"></div>
-                        <div class="track-sidebar-footer">
-                            <span id="track-range-display">1 / 1</span>
-                        </div>
-                    </div>
-
-                    <!-- Timeline Area -->
-                    <div class="timeline-area">
-                        <div class="timeline-header">
-                            <div class="timeline-ruler" id="timeline-ruler"></div>
-                        </div>
-                        <div class="timeline-tracks" id="timeline-tracks"></div>
-                        <div class="timeline-info-bar">
-                            <span id="timeline-position-display">0:00 / 0:00 | M1/4</span>
-                        </div>
-                    </div>
-                </div>
-
                 <!-- View Tabs -->
                 <div class="editor-view-tabs">
-                    <button class="editor-view-tab active" data-view="pattern">Pattern Editor</button>
+                    <button class="editor-view-tab active" data-view="song">Song Editor</button>
                     <button class="editor-view-tab" data-view="sample">Sample Editor</button>
+                    <button class="editor-view-tab" data-view="info">Song Info</button>
                 </div>
+
+                <!-- Song Editor View (Track Sidebar + Timeline) -->
+                <div class="song-editor-container" id="song-editor-view">
+                    <div class="track-layout-area">
+                        <!-- Track List Sidebar (DAW-style) -->
+                        <div class="track-sidebar">
+                            <div class="track-sidebar-header">
+                                <span>Tracks</span>
+                                <div class="track-sidebar-buttons">
+                                    <button id="btn-add-track" title="Add Track">+</button>
+                                    <button id="btn-remove-track" title="Remove Track">-</button>
+                                    <button id="btn-scroll-tracks-up" title="Scroll Up">&#9650;</button>
+                                    <button id="btn-scroll-tracks-down" title="Scroll Down">&#9660;</button>
+                                </div>
+                            </div>
+                            <div id="track-list" class="track-list"></div>
+                            <div class="track-sidebar-footer">
+                                <span id="track-range-display">1 / 1</span>
+                            </div>
+                        </div>
+
+                        <!-- Timeline Area -->
+                        <div class="timeline-area">
+                            <div class="timeline-header">
+                                <div class="timeline-ruler" id="timeline-ruler"></div>
+                            </div>
+                            <div class="timeline-tracks" id="timeline-tracks"></div>
+                            <div class="timeline-info-bar">
+                                <span id="timeline-position-display">0:00 / 0:00 | M1/4</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="song-editor-footer">
+                        <button id="pattern-toggle-btn" title="Show/Hide Pattern Editor">Hide Pattern</button>
+                    </div>
+                </div>
+
+                <!-- Song Info View -->
+                <div class="song-info-container hidden" id="song-info-view">
+                    <div class="song-info-header">Song Info</div>
+                    <textarea id="song-info-text" placeholder="Write notes about the song here..."></textarea>
+                </div>
+
+                <!-- Divider between song editor and pattern editor -->
+                <div class="editor-splitter" id="editor-splitter" title="Drag to resize (double-click to collapse/expand)"></div>
 
                 <!-- Pattern Editor View -->
                 <div class="pattern-editor-area" id="pattern-editor-area">
                     <div class="pattern-editor-header">
                         <span id="pattern-editor-title">No pattern selected</span>
                         <div class="pattern-editor-controls">
-                            <label>
+                            <label class="tracker-only">
                                 Steps: <input type="number" id="pattern-steps" value="16" min="1" max="256">
                             </label>
-                            <label>
+                            <label class="tracker-only">
                                 LPB: <input type="number" id="pattern-lpb" value="4" min="1" max="32">
                             </label>
-                            <label>
+                            <label class="tracker-only">
                                 Edit Step: <input type="number" id="edit-step" value="1" min="0" max="16" title="Cursor movement after note entry">
                             </label>
-                            <button id="btn-apply-pattern-steps">Apply</button>
+                            <button id="btn-apply-pattern-steps" class="tracker-only">Apply</button>
                         </div>
                     </div>
                     <div class="tracker-container" id="tracker-container">
@@ -137,7 +175,22 @@
                             </div>
                         </div>
                         <div class="velocity-lane">
-                            <canvas id="velocity-canvas"></canvas>
+                            <div class="velocity-keys-spacer">
+                                <select id="velocity-param-select" title="Velocity/Parameter Lane">
+                                    <option value="p5" selected>p5 (vel)</option>
+                                    <option value="p6">p6</option>
+                                    <option value="p7">p7</option>
+                                    <option value="p8">p8</option>
+                                    <option value="p9">p9</option>
+                                    <option value="p10">p10</option>
+                                    <option value="p11">p11</option>
+                                    <option value="p12">p12</option>
+                                    <option value="p13">p13</option>
+                                </select>
+                            </div>
+                            <div class="velocity-grid">
+                                <canvas id="velocity-canvas"></canvas>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -188,10 +241,11 @@
             </div>
 
             <!-- Code Editor Panel -->
-            <div class="editor-container">
+            <div class="editor-container" id="editor-container">
                 <div class="editor-header">
+                    <button id="btn-toggle-editor" class="mobile-toggle" title="Toggle Code Panel">&#9660;</button>
                     <span>Csound Code</span>
-                    <span class="shortcut-hint">(Alt+Space to compile)</span>
+                    <span class="shortcut-hint">(Alt+C to compile)</span>
                     <button id="btn-compile">Compile</button>
                 </div>
 
@@ -290,12 +344,42 @@
             <div class="context-menu-item" data-action="cut-clip">Cut Clip</div>
             <div class="context-menu-item" data-action="paste-clip">Paste Clip</div>
             <div class="context-menu-separator"></div>
+            <div class="context-menu-item" data-action="make-unique">Make Unique</div>
+            <div class="context-menu-item" data-action="convert-pattern">Convert Pattern</div>
+            <div class="context-menu-separator"></div>
             <div class="context-menu-item" data-action="delete-clip">Delete Clip</div>
+        </div>
+
+        <!-- Piano Roll Context Menu -->
+        <div id="piano-roll-context-menu" class="context-menu">
+            <div class="context-menu-item" data-action="copy">Copy</div>
+            <div class="context-menu-item" data-action="cut">Cut</div>
+            <div class="context-menu-item" data-action="paste">Paste</div>
+            <div class="context-menu-separator"></div>
+            <div class="context-menu-item has-submenu" data-action="quantize">Quantize &#9656;</div>
+            <div class="context-submenu" data-menu="quantize">
+                <div class="context-menu-item" data-action="quantize" data-grid="1">1/1 bar</div>
+                <div class="context-menu-item" data-action="quantize" data-grid="0.5">1/2 bar</div>
+                <div class="context-menu-item" data-action="quantize" data-grid="0.25">1/4 note</div>
+                <div class="context-menu-item" data-action="quantize" data-grid="0.125">1/8th note</div>
+                <div class="context-menu-item" data-action="quantize" data-grid="0.0625">1/16th note</div>
+                <div class="context-menu-item" data-action="quantize" data-grid="0.03125">1/32nd note</div>
+                <div class="context-menu-item" data-action="quantize" data-grid="0.015625">1/64th note</div>
+                <div class="context-menu-item" data-action="quantize" data-grid="0.0078125">1/128th note</div>
+            </div>
+            <div class="context-menu-separator"></div>
+            <div class="context-menu-item" data-action="delete">Delete</div>
         </div>
 
         <!-- Code Editor Context Menu -->
         <div id="code-editor-context-menu" class="context-menu">
             <div class="context-menu-item" data-action="insert-sampler">Insert Sampler</div>
+            <div class="context-menu-item" data-action="insert-oscillator">Insert Oscillator</div>
+            <div class="context-menu-item" data-action="insert-envelope">Insert Envelope</div>
+            <div class="context-menu-item" data-action="insert-filter">Insert Filter</div>
+            <div class="context-menu-item" data-action="insert-reverb">Insert Reverb</div>
+            <div class="context-menu-separator"></div>
+            <div class="context-menu-item" data-action="insert-pfield-comment">Insert P-field Comments</div>
         </div>
     </div>
 

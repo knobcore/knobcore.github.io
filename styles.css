@@ -4,6 +4,10 @@
     box-sizing: border-box;
 }
 
+:root {
+    --ui-scale: 1;
+}
+
 body {
     font-family: 'Courier New', monospace;
     background: #1a1a2e;
@@ -15,7 +19,10 @@ body {
 #app {
     display: flex;
     flex-direction: column;
-    height: 100vh;
+    width: calc(100vw / var(--ui-scale));
+    height: calc(100vh / var(--ui-scale));
+    transform: scale(var(--ui-scale));
+    transform-origin: top left;
 }
 
 header {
@@ -57,19 +64,97 @@ header h1 {
     color: #1a1a2e;
 }
 
-.demo-controls {
+/* Menu Bar with Dropdowns */
+.menu-bar {
     display: flex;
-    gap: 4px;
+    gap: 2px;
+}
+
+.dropdown {
+    position: relative;
+}
+
+.dropdown-toggle {
+    background: #0f3460;
+    color: #eee;
+    border: none;
+    padding: 8px 16px;
+    cursor: pointer;
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 0.9em;
+}
+
+.dropdown-toggle:hover,
+.dropdown.open .dropdown-toggle {
+    background: #16213e;
+    color: #4ecca3;
+}
+
+.dropdown-menu {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 4px;
+    min-width: 160px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    z-index: 1000;
+    padding: 4px 0;
+}
+
+.dropdown.open .dropdown-menu {
+    display: block;
+}
+
+.dropdown-item {
+    padding: 10px 16px;
+    cursor: pointer;
+    color: #eee;
+    font-size: 0.85em;
+    white-space: nowrap;
+}
+
+.dropdown-item:hover {
+    background: #e94560;
+    color: #fff;
+}
+
+.dropdown-separator {
+    height: 1px;
+    background: #0f3460;
+    margin: 4px 8px;
+}
+
+.demo-controls {
+    display: grid;
+    grid-template-columns: auto auto;
+    grid-template-rows: auto auto;
+    column-gap: 6px;
+    row-gap: 4px;
     align-items: center;
-    margin-left: 12px;
+    justify-items: center;
+    margin-left: auto;
     padding-left: 12px;
     border-left: 1px solid #333;
+    width: fit-content;
+    max-width: 100%;
 }
 
 .demo-label {
     color: #888;
     font-size: 0.85em;
     margin-right: 4px;
+    grid-column: 1;
+}
+
+.demo-buttons-group {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    justify-content: center;
 }
 
 .demo-btn {
@@ -88,6 +173,7 @@ header h1 {
     background: #4ecca3;
     color: #1a1a2e;
 }
+
 
 .transport-controls {
     display: flex;
@@ -200,11 +286,11 @@ header h1 {
 .track-layout-area {
     display: flex;
     flex-direction: row;
-    height: 420px;
+    height: 100%;
     min-height: 120px;
-    max-height: 420px;
+    max-height: none;
     border-bottom: 2px solid #0f3460;
-    flex-shrink: 0;
+    flex: 1 1 auto;
 }
 
 /* Main Editor Area (replaces center-editor-area) */
@@ -260,7 +346,7 @@ header h1 {
 #sequence-list {
     flex: 1;
     overflow-y: auto;
-    padding: 5px;
+    padding: 25px;
 }
 
 .sequence-item {
@@ -466,8 +552,8 @@ header h1 {
     color: #666;
 }
 
-/* Track Editor View (contains timeline) */
-.track-editor-view {
+/* Song Editor View (contains timeline) */
+.song-editor-container {
     flex: 1;
     display: flex;
     flex-direction: column;
@@ -475,8 +561,66 @@ header h1 {
     min-height: 150px;
 }
 
-.track-editor-view.hidden {
+.song-editor-container.hidden {
     display: none;
+}
+
+.song-info-container {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    background: #12122a;
+    border-bottom: 2px solid #0f3460;
+    min-height: 150px;
+}
+
+.song-info-container.hidden {
+    display: none;
+}
+
+.song-info-header {
+    background: #0f3460;
+    color: #4ecca3;
+    padding: 6px 10px;
+    font-size: 0.85em;
+    border-bottom: 1px solid #16213e;
+}
+
+#song-info-text {
+    flex: 1;
+    resize: none;
+    background: #0f0f24;
+    color: #eee;
+    border: none;
+    padding: 10px;
+    font-family: 'Courier New', monospace;
+    font-size: 0.9em;
+    outline: none;
+}
+
+.song-editor-footer {
+    background: #0f3460;
+    border-top: 1px solid #16213e;
+    padding: 4px 8px;
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    flex-shrink: 0;
+}
+
+#pattern-toggle-btn {
+    background: #1a1a2e;
+    color: #eee;
+    border: 1px solid #16213e;
+    padding: 4px 10px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.75em;
+}
+
+#pattern-toggle-btn:hover {
+    background: #4ecca3;
+    color: #1a1a2e;
 }
 
 /* Timeline Area */
@@ -507,7 +651,7 @@ header h1 {
     height: 100%;
     display: flex;
     align-items: center;
-    padding: 0 4px;
+    padding: 0;
     font-size: 0.7em;
     color: #666;
     cursor: pointer;
@@ -619,6 +763,29 @@ header h1 {
     box-shadow: 0 0 0 2px #e94560, 0 2px 6px rgba(233, 69, 96, 0.4);
 }
 
+.timeline-selection-box {
+    position: absolute;
+    border: 1px dashed #4ecca3;
+    background: rgba(78, 204, 163, 0.15);
+    pointer-events: none;
+    z-index: 5;
+}
+
+/* Recording preview expansion indicator */
+.timeline-clip.recording-preview {
+    box-shadow: 0 0 0 2px #ff4444, 0 2px 8px rgba(255, 68, 68, 0.5);
+    animation: recording-pulse 0.5s ease-in-out infinite alternate;
+}
+
+@keyframes recording-pulse {
+    from {
+        box-shadow: 0 0 0 2px #ff4444, 0 2px 8px rgba(255, 68, 68, 0.5);
+    }
+    to {
+        box-shadow: 0 0 0 3px #ff6666, 0 2px 12px rgba(255, 68, 68, 0.7);
+    }
+}
+
 /* Clip header with name */
 .timeline-clip .clip-header {
     padding: 2px 20px 2px 18px;
@@ -688,6 +855,34 @@ header h1 {
 .timeline-clip .clip-split-handle:hover {
     background: #ff6b8a;
     transform: translateY(-50%) scale(1.1);
+}
+
+/* Expand/contract handle */
+.timeline-clip .clip-expand-handle {
+    position: absolute;
+    top: 50%;
+    right: 2px;
+    transform: translateY(-50%);
+    width: 16px;
+    height: 16px;
+    background: rgba(0,0,0,0.4);
+    border-radius: 50%;
+    cursor: ew-resize;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    color: #fff;
+    z-index: 9;
+}
+
+.timeline-clip .clip-expand-handle:hover {
+    background: rgba(255, 255, 255, 0.35);
+}
+
+.timeline-clip.expanded .clip-expand-handle {
+    background: rgba(78, 204, 163, 0.9);
+    color: #1a1a2e;
 }
 
 /* Library item dragging */
@@ -831,9 +1026,36 @@ header h1 {
     display: flex;
     flex-direction: column;
     background: #12122a;
-    flex: 1;
+    flex: 0 0 auto;
+    height: 280px;
+    min-height: 120px;
     overflow: hidden;
     margin-left: 140px;  /* Align with timeline (after track sidebar) */
+}
+
+.pattern-editor-area.collapsed {
+    height: 0;
+    min-height: 0;
+    flex: 0 0 0;
+    overflow: hidden;
+    border-top: none;
+}
+
+.editor-splitter {
+    height: 6px;
+    flex: 0 0 6px;
+    background: #0f3460;
+    cursor: row-resize;
+    margin-left: 140px;
+    width: calc(100% - 140px);
+}
+
+.editor-splitter:hover {
+    background: #1b4f86;
+}
+
+.editor-splitter.hidden {
+    display: none;
 }
 
 .pattern-editor-header {
@@ -856,6 +1078,11 @@ header h1 {
     display: flex;
     gap: 8px;
     align-items: center;
+}
+
+/* Hide tracker-specific controls when in piano roll mode */
+.pattern-editor-area.piano-mode .pattern-editor-controls .tracker-only {
+    display: none;
 }
 
 .pattern-editor-controls label {
@@ -1024,7 +1251,7 @@ header h1 {
 .piano-roll-main {
     flex: 1;
     display: flex;
-    overflow: auto;
+    overflow: hidden;
 }
 
 .piano-keys {
@@ -1032,7 +1259,13 @@ header h1 {
     flex-shrink: 0;
     background: #0a0a1a;
     border-right: 1px solid #333;
-    overflow-y: auto;
+    overflow: hidden;
+    scrollbar-width: none;
+}
+
+.piano-keys::-webkit-scrollbar {
+    width: 0;
+    height: 0;
 }
 
 .piano-key {
@@ -1046,6 +1279,7 @@ header h1 {
     border-bottom: 1px solid #222;
     cursor: pointer;
     user-select: none;
+    box-sizing: border-box;
 }
 
 .piano-key.white {
@@ -1078,15 +1312,46 @@ header h1 {
 }
 
 .velocity-lane {
-    height: 60px;
+    height: 50px;
     background: #12122a;
     border-top: 1px solid #333;
-    padding: 4px;
+    display: flex;
+    align-items: stretch;
+    flex-shrink: 0;
+    padding: 0;
+}
+
+.velocity-keys-spacer {
+    width: 60px;
+    flex-shrink: 0;
+    border-right: 1px solid #333;
+    background: #0a0a1a;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 4px;
+}
+
+#velocity-param-select {
+    width: 100%;
+    background: #0f3460;
+    color: #eee;
+    border: 1px solid #16213e;
+    border-radius: 3px;
+    font-size: 0.6em;
+    padding: 2px 4px;
+}
+
+.velocity-grid {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
 }
 
 #velocity-canvas {
-    width: 100%;
     height: 100%;
+    display: block;
+    width: auto;
 }
 
 /* Sample Editor Container */
@@ -1174,6 +1439,7 @@ header h1 {
     background: #0a0a14;
     border: 1px solid #0f3460;
     margin: 8px;
+    padding: 0;
     overflow: hidden;
     min-height: 200px;
 }
@@ -1182,14 +1448,16 @@ header h1 {
     width: 100%;
     height: 100%;
     display: block;
+    box-sizing: border-box;
+    padding: 25px;
 }
 
 .waveform-overlay {
     position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
+    top: 25px;
+    left: 25px;
+    right: 25px;
+    bottom: 25px;
     pointer-events: none;
 }
 
@@ -1446,8 +1714,13 @@ header h1 {
     display: flex;
     flex-direction: column;
     flex-shrink: 0;
-    overflow-y: auto;
-    overflow-x: hidden;
+    overflow: hidden;
+    scrollbar-width: none;
+}
+
+.piano-keys::-webkit-scrollbar {
+    width: 0;
+    height: 0;
 }
 
 .piano-key {
@@ -1459,6 +1732,7 @@ header h1 {
     border-bottom: 1px solid #0f3460;
     cursor: pointer;
     user-select: none;
+    box-sizing: border-box;
 }
 
 .piano-key.white {
@@ -1492,15 +1766,46 @@ header h1 {
 }
 
 .velocity-lane {
-    height: 60px;
+    height: 50px;
     background: #12122a;
     border-top: 1px solid #0f3460;
     flex-shrink: 0;
+    display: flex;
+    align-items: stretch;
+    padding: 0;
+}
+
+.velocity-keys-spacer {
+    width: 60px;
+    flex-shrink: 0;
+    border-right: 1px solid #0f3460;
+    background: #16213e;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 4px;
+}
+
+#velocity-param-select {
+    width: 100%;
+    background: #0f3460;
+    color: #eee;
+    border: 1px solid #16213e;
+    border-radius: 3px;
+    font-size: 0.6em;
+    padding: 2px 4px;
+}
+
+.velocity-grid {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
 }
 
 #velocity-canvas {
-    width: 100%;
     height: 100%;
+    display: block;
+    width: auto;
 }
 
 .piano-note {
@@ -1657,6 +1962,14 @@ header h1 {
     z-index: 9;
 }
 
+.column-labels .note-column-group {
+    flex-direction: column;
+}
+
+.note-column-labels {
+    display: flex;
+}
+
 .column-labels .row-number {
     background: transparent;
     width: 2.5em;
@@ -1763,8 +2076,12 @@ header h1 {
 .fx-col-controls {
     display: flex;
     align-items: center;
-    padding: 0 2px;
+    justify-content: flex-start;
+    padding: 2px 2px 1px;
     gap: 1px;
+    width: 100%;
+    box-sizing: border-box;
+    padding-left: 6em; /* note (3.5em) + vel (2.5em) */
 }
 
 .fx-col-controls button {
@@ -2696,6 +3013,34 @@ body.selecting * {
     color: #666;
 }
 
+.context-menu-item.has-submenu {
+    position: relative;
+}
+
+.context-submenu {
+    position: absolute;
+    top: 0;
+    left: 100%;
+    margin-left: 6px;
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 4px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    min-width: 120px;
+    padding: 4px 0;
+    display: none;
+    z-index: 1001;
+}
+
+.context-menu-item.has-submenu:hover + .context-submenu,
+.context-submenu:hover {
+    display: block;
+}
+
+.context-menu-item.has-submenu.open + .context-submenu {
+    display: block;
+}
+
 .context-menu-separator {
     height: 1px;
     background: #0f3460;
@@ -2809,8 +3154,47 @@ html {
     }
 }
 
-/* Very small screens */
+/* Mobile panel toggle button */
+.mobile-toggle {
+    display: none;
+    background: #1a1a2e;
+    color: #4ecca3;
+    border: 1px solid #4ecca3;
+    padding: 4px 8px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.9em;
+    margin-right: 8px;
+}
+
+.mobile-toggle:hover {
+    background: #4ecca3;
+    color: #1a1a2e;
+}
+
+.editor-container.collapsed {
+    max-height: 48px !important;
+    min-height: 48px !important;
+    overflow: hidden;
+}
+
+.editor-container.collapsed .main-tabs,
+.editor-container.collapsed .tab-content {
+    display: none;
+}
+
+.editor-container.collapsed #btn-toggle-editor {
+    transform: rotate(180deg);
+}
+
+/* ============================================
+   TABLET LAYOUT (768px - 1024px)
+   ============================================ */
 @media (max-width: 1024px) {
+    html {
+        font-size: 14px;
+    }
+
     .header-top {
         flex-wrap: wrap;
         gap: 8px;
@@ -2820,5 +3204,648 @@ html {
         margin-left: 0;
         padding-left: 0;
         border-left: none;
+    }
+
+    /* Stack main container vertically */
+    .main-container {
+        flex-direction: column;
+    }
+
+    /* Code editor as bottom panel */
+    .editor-container {
+        max-width: 100%;
+        min-width: 100%;
+        max-height: 35vh;
+        border-left: none;
+        border-top: 2px solid #0f3460;
+    }
+
+    /* Smaller track sidebar */
+    .track-sidebar {
+        width: 100px;
+        min-width: 100px;
+    }
+
+    /* Pattern editor alignment */
+    .pattern-editor-area {
+        margin-left: 100px;
+    }
+
+    .editor-splitter {
+        margin-left: 100px;
+        width: calc(100% - 100px);
+    }
+
+    /* Larger touch targets */
+    .transport-controls button {
+        padding: 10px 14px;
+        min-height: 40px;
+    }
+
+    .file-controls button {
+        padding: 10px 14px;
+        min-height: 40px;
+    }
+
+    /* Hide keyboard hint on tablet */
+    .keyboard-hint {
+        display: none;
+    }
+}
+
+/* ============================================
+   MOBILE LAYOUT (max-width: 768px)
+   ============================================ */
+@media (max-width: 768px) {
+    html {
+        font-size: 13px;
+    }
+
+    body {
+        overflow: auto;
+    }
+
+    #app {
+        height: auto;
+        min-height: 100vh;
+    }
+
+    /* Header adjustments */
+    header {
+        padding: 6px 10px;
+    }
+
+    .header-top {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .file-controls {
+        justify-content: center;
+        flex-wrap: wrap;
+    }
+
+    .file-controls button {
+        flex: 1;
+        min-width: 60px;
+        padding: 12px 8px;
+        font-size: 0.9em;
+    }
+
+    .demo-controls {
+        justify-content: center;
+        padding: 8px 0;
+        border-top: 1px solid #0f3460;
+        margin-top: 8px;
+    }
+
+    .demo-btn {
+        padding: 10px 16px;
+        min-width: 44px;
+    }
+
+    /* Transport controls - wrap and center */
+    .transport-controls {
+        justify-content: center;
+        gap: 6px;
+    }
+
+    .transport-controls button {
+        padding: 12px 16px;
+        min-height: 44px;
+        font-size: 1.1em;
+    }
+
+    #btn-play, #btn-stop {
+        font-size: 1.3em;
+        padding: 10px 20px;
+    }
+
+    .separator {
+        display: none;
+    }
+
+    .transport-controls label {
+        font-size: 0.9em;
+    }
+
+    .transport-controls input[type="number"],
+    .transport-controls select {
+        padding: 8px;
+        font-size: 1em;
+        min-height: 40px;
+    }
+
+    #midi-input {
+        max-width: 100px;
+    }
+
+    /* Main container - full vertical stack */
+    .main-container {
+        flex-direction: column;
+        overflow: visible;
+    }
+
+    /* Track layout area */
+    .track-layout-area {
+        height: auto;
+        min-height: 200px;
+        max-height: 50vh;
+        flex-direction: column;
+    }
+
+    /* Track sidebar - horizontal on mobile */
+    .track-sidebar {
+        width: 100%;
+        min-width: 100%;
+        height: 80px;
+        flex-direction: row;
+        border-right: none;
+        border-bottom: 2px solid #0f3460;
+    }
+
+    .track-sidebar-header {
+        flex-direction: column;
+        padding: 4px 8px;
+        min-width: 80px;
+    }
+
+    .track-sidebar-buttons {
+        flex-wrap: wrap;
+        justify-content: center;
+    }
+
+    .track-sidebar-buttons button {
+        width: 32px;
+        height: 32px;
+        font-size: 1em;
+    }
+
+    .track-list {
+        flex-direction: row;
+        margin-top: 0;
+        overflow-x: auto;
+        overflow-y: hidden;
+    }
+
+    .track-list-item {
+        min-width: 100px;
+        height: 100%;
+        flex-direction: column;
+        padding: 4px;
+        border-bottom: none;
+        border-right: 1px solid #0f3460;
+    }
+
+    .track-sidebar-footer {
+        min-width: 60px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    /* Timeline area */
+    .timeline-area {
+        min-height: 150px;
+    }
+
+    .timeline-track-row {
+        height: 50px;
+    }
+
+    .timeline-clip {
+        height: 44px;
+    }
+
+    /* Pattern editor - full width */
+    .pattern-editor-area {
+        margin-left: 0;
+        min-height: 300px;
+    }
+
+    .editor-splitter {
+        margin-left: 0;
+        width: 100%;
+    }
+
+    .pattern-editor-header {
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
+    .pattern-editor-controls {
+        flex-wrap: wrap;
+        justify-content: center;
+    }
+
+    .pattern-editor-controls input[type="number"] {
+        width: 60px;
+        padding: 8px;
+    }
+
+    .pattern-editor-controls button {
+        padding: 8px 16px;
+        min-height: 40px;
+    }
+
+    /* Editor view tabs */
+    .editor-view-tab {
+        padding: 12px 16px;
+        font-size: 1em;
+    }
+
+    /* Tracker container */
+    .tracker-container {
+        padding: 4px;
+    }
+
+    /* Cells - larger for touch */
+    .cell {
+        padding: 8px 4px;
+        font-size: 0.9em;
+        min-height: 36px;
+    }
+
+    .cell.note {
+        width: 4em;
+    }
+
+    .cell.amp {
+        width: 3em;
+    }
+
+    .cell.fx {
+        width: 5em;
+    }
+
+    .row-number {
+        width: 2.5em;
+        padding: 8px 4px;
+    }
+
+    /* Piano roll */
+    .piano-roll-toolbar {
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
+    .piano-roll-toolbar select,
+    .piano-roll-toolbar button {
+        padding: 10px 12px;
+        min-height: 40px;
+    }
+
+    .piano-keys {
+        width: 50px;
+    }
+
+    .piano-key {
+        height: 24px;
+        font-size: 0.7em;
+    }
+
+    /* Code editor panel */
+    .editor-container {
+        max-width: 100%;
+        min-width: 100%;
+        max-height: none;
+        height: auto;
+        min-height: 250px;
+        border-left: none;
+        border-top: 2px solid #0f3460;
+    }
+
+    /* Show mobile toggle button */
+    .mobile-toggle {
+        display: inline-block;
+    }
+
+    .editor-header {
+        padding: 10px;
+    }
+
+    .editor-header button {
+        padding: 10px 16px;
+        min-height: 40px;
+    }
+
+    /* Main tabs - scrollable */
+    .main-tabs {
+        overflow-x: auto;
+        flex-wrap: nowrap;
+    }
+
+    .main-tab {
+        flex: none;
+        padding: 12px 16px;
+        white-space: nowrap;
+    }
+
+    /* Instrument tabs */
+    .instrument-tabs {
+        padding: 6px;
+        gap: 4px;
+    }
+
+    .instr-tab {
+        padding: 8px 12px;
+        font-size: 0.85em;
+        min-width: 36px;
+    }
+
+    #code-editor, #opcodes-editor {
+        font-size: 0.95em;
+        min-height: 200px;
+    }
+
+    /* Sample sections */
+    .sample-sections {
+        gap: 8px;
+        padding: 8px;
+    }
+
+    .sample-section-header {
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
+    .sample-section-header button {
+        padding: 8px 16px;
+        min-height: 40px;
+    }
+
+    .library-item,
+    .ftable-item {
+        padding: 10px;
+    }
+
+    .library-item button,
+    .ftable-item button {
+        padding: 8px 12px;
+        min-height: 36px;
+    }
+
+    /* Sample editor */
+    .sample-editor-toolbar {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .sample-editor-controls {
+        justify-content: center;
+    }
+
+    .sample-editor-controls button {
+        padding: 10px 14px;
+        min-height: 40px;
+    }
+
+    .waveform-container {
+        min-height: 150px;
+        margin: 4px;
+    }
+
+    /* Console - collapsible on mobile */
+    #console-container {
+        height: auto;
+        max-height: 150px;
+    }
+
+    #console-header {
+        padding: 8px 10px;
+    }
+
+    #btn-toggle-console {
+        padding: 8px 12px;
+        min-height: 36px;
+    }
+
+    #console {
+        max-height: 100px;
+    }
+
+    /* Status bar */
+    #status-bar {
+        padding: 10px 15px;
+        font-size: 0.9em;
+    }
+
+    /* Context menus - larger touch targets */
+    .context-menu-item {
+        padding: 14px 20px;
+        font-size: 1em;
+    }
+
+    /* Chords grid */
+    .chord-btn {
+        padding: 10px 8px;
+        min-width: 40px;
+        font-size: 0.8em;
+    }
+
+    .chord-root {
+        width: 32px;
+        font-size: 0.9em;
+    }
+}
+
+/* ============================================
+   SMALL MOBILE (max-width: 480px)
+   ============================================ */
+@media (max-width: 480px) {
+    html {
+        font-size: 12px;
+    }
+
+    header {
+        padding: 4px 6px;
+    }
+
+    .file-controls button {
+        padding: 10px 6px;
+        font-size: 0.85em;
+    }
+
+    .transport-controls {
+        gap: 4px;
+    }
+
+    .transport-controls button {
+        padding: 10px 12px;
+    }
+
+    .transport-controls label {
+        font-size: 0.8em;
+    }
+
+    .transport-controls input[type="number"] {
+        width: 3.5em;
+    }
+
+    /* Hide some controls on very small screens */
+    #grid-snap {
+        display: none;
+    }
+
+    #midi-input {
+        display: none;
+    }
+
+    /* Smaller track layout */
+    .track-layout-area {
+        max-height: 40vh;
+    }
+
+    .track-sidebar {
+        height: 60px;
+    }
+
+    .track-sidebar-header span {
+        font-size: 0.8em;
+    }
+
+    .track-list-item {
+        min-width: 80px;
+    }
+
+    .pattern-editor-area {
+        min-height: 250px;
+    }
+
+    /* Smaller cells */
+    .cell {
+        padding: 6px 2px;
+        font-size: 0.85em;
+    }
+
+    .cell.note {
+        width: 3.5em;
+    }
+
+    .cell.amp {
+        width: 2.5em;
+    }
+
+    .cell.fx {
+        width: 4em;
+    }
+
+    /* Editor */
+    .editor-container {
+        min-height: 200px;
+    }
+
+    .main-tab {
+        padding: 10px 12px;
+        font-size: 0.85em;
+    }
+
+    .instr-tab {
+        padding: 6px 10px;
+        min-width: 32px;
+    }
+}
+
+/* ============================================
+   LANDSCAPE MOBILE
+   ============================================ */
+@media (max-width: 896px) and (orientation: landscape) {
+    .track-layout-area {
+        height: 35vh;
+        max-height: 35vh;
+    }
+
+    .track-sidebar {
+        width: 80px;
+        min-width: 80px;
+        height: auto;
+        flex-direction: column;
+        border-right: 2px solid #0f3460;
+        border-bottom: none;
+    }
+
+    .track-list {
+        flex-direction: column;
+        overflow-y: auto;
+        overflow-x: hidden;
+        margin-top: 24px;
+    }
+
+    .track-list-item {
+        height: 50px;
+        min-width: auto;
+        flex-direction: row;
+        border-right: none;
+        border-bottom: 1px solid #0f3460;
+    }
+
+    .pattern-editor-area {
+        margin-left: 80px;
+        min-height: 200px;
+    }
+
+    .editor-container {
+        max-height: 40vh;
+    }
+}
+
+/* ============================================
+   TOUCH DEVICE OPTIMIZATIONS
+   ============================================ */
+@media (hover: none) and (pointer: coarse) {
+    /* Larger tap targets for touch */
+    button,
+    select,
+    input[type="number"] {
+        min-height: 44px;
+    }
+
+    .track-controls button {
+        width: 28px;
+        height: 28px;
+    }
+
+    .track-list-item .btn-track-mute,
+    .track-list-item .btn-track-solo {
+        width: 28px;
+        height: 28px;
+    }
+
+    /* Disable hover effects that don't work on touch */
+    .cell:hover {
+        background: inherit;
+    }
+
+    /* Better scrolling */
+    .tracker-container,
+    .timeline-tracks,
+    .piano-roll-main {
+        -webkit-overflow-scrolling: touch;
+    }
+
+    /* Prevent double-tap zoom on buttons */
+    button {
+        touch-action: manipulation;
+    }
+}
+
+/* ============================================
+   PRINT STYLES (optional - hide UI chrome)
+   ============================================ */
+@media print {
+    header,
+    .editor-container,
+    #console-container,
+    #status-bar,
+    .context-menu {
+        display: none !important;
+    }
+
+    .main-container {
+        display: block;
+    }
+
+    .center-panel {
+        width: 100%;
     }
 }

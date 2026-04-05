@@ -82,6 +82,7 @@ var scheduleAheadTime = 0.1;  // Schedule notes 100ms ahead (seconds)
 var lookahead = 25;           // Check every 25ms (milliseconds)
 var nextStepTime = 0;         // When the next step should play (AudioContext time)
 var playbackStartTime = 0;    // When playback started (AudioContext time)
+var playbackStartBeat = 0;    // Beat position at playback start
 
 // Tracker state - DAW model with 128 tracks and clip-based timeline
 var state = {
@@ -111,6 +112,7 @@ var state = {
     instruments: defaultInstruments.slice(),
     currentInstrument: 0,
     opcodes: '',
+    songInfo: '',
     // Sample library: imported samples not yet loaded to ftables
     sampleLibrary: [],
     // Ftable pool: samples loaded into Csound ftables
@@ -156,6 +158,8 @@ var state = {
         loopStart: 0,         // Loop start in beats
         loopEnd: 16,          // Loop end in beats
         snapToMeasure: true,  // Snap clip placement to measure boundaries
+        cursorBeat: 0,
+        cursorTrack: 0,
         // Grid snap value in beats: 1/256=0.015625, 1/128=0.03125, 1/64=0.0625, 1/32=0.125, 1/16=0.25, 1/8=0.5, 1/4=1, 1/2=2, 1bar=4
         gridSnap: 1,          // Default: 1 beat (quarter note)
         gridSnapOptions: [
@@ -216,6 +220,149 @@ function logVoice(operation, voiceKey, details) {
     }
     consoleLog(msg);
 }
+
+// ============================================
+// UNDO SYSTEM
+// ============================================
+var undoStack = [];
+var redoStack = [];
+var MAX_UNDO = 50;
+
+function pushUndo(actionType, data) {
+    undoStack.push({
+        type: actionType,
+        data: JSON.parse(JSON.stringify(data)),
+        timestamp: Date.now()
+    });
+    // Limit undo stack size
+    while (undoStack.length > MAX_UNDO) {
+        undoStack.shift();
+    }
+    // Clear redo stack when new action is performed
+    redoStack = [];
+}
+
+function undo() {
+    if (undoStack.length === 0) {
+        consoleLog('Nothing to undo');
+        return;
+    }
+    var action = undoStack.pop();
+
+    // Save current state to redo stack
+    var redoData = captureStateForUndo(action.type);
+    redoStack.push({
+        type: action.type,
+        data: redoData,
+        timestamp: Date.now()
+    });
+
+    // Restore the previous state
+    restoreStateFromUndo(action);
+    consoleLog('Undo: ' + action.type);
+}
+
+function redo() {
+    if (redoStack.length === 0) {
+        consoleLog('Nothing to redo');
+        return;
+    }
+    var action = redoStack.pop();
+
+    // Save current state to undo stack
+    var undoData = captureStateForUndo(action.type);
+    undoStack.push({
+        type: action.type,
+        data: undoData,
+        timestamp: Date.now()
+    });
+
+    // Restore the redo state
+    restoreStateFromUndo(action);
+    consoleLog('Redo: ' + action.type);
+}
+
+function captureStateForUndo(actionType) {
+    switch (actionType) {
+        case 'pattern-edit':
+        case 'piano-edit':
+            return {
+                patterns: JSON.parse(JSON.stringify(state.patterns)),
+                selectedClip: JSON.parse(JSON.stringify(state.selectedClip))
+            };
+        case 'clip-edit':
+            return {
+                tracks: JSON.parse(JSON.stringify(state.tracks)),
+                patterns: JSON.parse(JSON.stringify(state.patterns)),
+                selectedClip: JSON.parse(JSON.stringify(state.selectedClip))
+            };
+        default:
+            return {
+                patterns: JSON.parse(JSON.stringify(state.patterns)),
+                tracks: JSON.parse(JSON.stringify(state.tracks))
+            };
+    }
+}
+
+function restoreStateFromUndo(action) {
+    switch (action.type) {
+        case 'pattern-edit':
+        case 'piano-edit':
+            state.patterns = action.data.patterns;
+            if (action.data.selectedClip) {
+                state.selectedClip = action.data.selectedClip;
+            }
+            invalidatePatternCache();
+            var pattern = getCurrentPattern();
+            if (pattern && pattern.type === 'piano') {
+                scheduleRenderPianoRoll();
+            } else {
+                renderTrackerGrid(true);
+            }
+            renderTimeline();
+            break;
+        case 'clip-edit':
+            state.tracks = action.data.tracks;
+            if (action.data.patterns) {
+                state.patterns = action.data.patterns;
+                invalidatePatternCache();
+            }
+            if (action.data.selectedClip) {
+                state.selectedClip = action.data.selectedClip;
+            }
+            renderTimeline();
+            renderTrackList();
+            if (state.selectedClip && state.selectedClip.clipId !== null) {
+                var clip = findClipById(state.selectedClip.trackId, state.selectedClip.clipId);
+                if (clip) {
+                    setPrimaryClip(state.selectedClip.trackId, state.selectedClip.clipId);
+                }
+            }
+            break;
+        default:
+            if (action.data.patterns) state.patterns = action.data.patterns;
+            if (action.data.tracks) state.tracks = action.data.tracks;
+            invalidatePatternCache();
+            renderTrackerGrid(true);
+            renderTimeline();
+            renderTrackList();
+    }
+}
+
+// Piano roll selection state
+var pianoSelection = {
+    active: false,
+    startBeat: 0,
+    endBeat: 0,
+    startPitch: 0,
+    endPitch: 0,
+    selectedNotes: []  // Array of indices into pattern.notes
+};
+
+var pianoContextState = {
+    beat: 0,
+    pitch: 0
+};
 
 // Get a summary of all active voices (for debugging)
 function getActiveVoicesSummary() {
@@ -297,6 +444,8 @@ var selection = {
 
 // Selected cells array
 var selectedCells = [];
+var uiFocus = 'tracker'; // 'timeline' | 'tracker' | 'piano'
+var selectedClips = [];
 
 // Drag state
 var dragState = {
@@ -369,28 +518,214 @@ function removeTrack() {
     return true;
 }
 
-// Create a new empty tracker pattern (step sequencer style, single-track)
-// Structure: multiple note columns, each with note (p4), amp (p5), and expandable FX
+// ============================================
+// UNIFIED NOTE/EVENT STRUCTURE
+// ============================================
+// All patterns use a single notes array with typed events:
+//
+// Note event (type: 'note' or missing for legacy):
+// {
+//     type: 'note',
+//     pitch: 60,           // MIDI note number (0-127)
+//     startBeat: 0.0,      // Start position in beats
+//     duration: 0.25,      // Duration in beats (piano roll). Tracker may leave null.
+//     velocity: 1.0,       // 0-1 (null = unset)
+//     column: 0,           // Note column for tracker view (polyphony)
+//     fx: []               // FX values for this note: ["0100", "0200", ...]
+// }
+//
+// Cell event (tracker-only, step-based params / OFF):
+// {
+//     type: 'cell',
+//     startBeat: 0.0,      // Step position in beats
+//     column: 0,
+//     note: 'OFF' | '',    // NOTE_OFF to end held notes
+//     amp: 'FF' | '',      // Hex velocity (00-FF) or empty
+//     fx: []               // FX values for this step: ["0100", ...]
+// }
+//
+// The pattern.type ('tracker' or 'piano') determines the VIEW.
+// Tracker view shows step-quantized cells, piano roll shows continuous notes.
+
+function isNoteEvent(ev) {
+    return ev && (ev.type === undefined || ev.type === 'note');
+}
+
+function isCellEvent(ev) {
+    return ev && ev.type === 'cell';
+}
+
+function ensurePatternNotes(pattern) {
+    if (pattern && !pattern.notes) pattern.notes = [];
+    return pattern ? pattern.notes : [];
+}
+
+function beatsMatch(a, b) {
+    return Math.abs(a - b) < 0.001;
+}
+
+function velocityToHex(velocity) {
+    if (velocity === null || velocity === undefined) return '--';
+    var clamped = Math.max(0, Math.min(1, velocity));
+    return Math.round(clamped * 255).toString(16).toUpperCase().padStart(2, '0');
+}
+
+function hexToVelocity(ampStr) {
+    if (!ampStr || ampStr === '--') return null;
+    var val = parseInt(ampStr, 16);
+    if (isNaN(val)) return null;
+    return Math.max(0, Math.min(255, val)) / 255;
+}
+
+function hasFxValues(fxArr) {
+    if (!fxArr || fxArr.length === 0) return false;
+    for (var i = 0; i < fxArr.length; i++) {
+        var v = fxArr[i];
+        if (v && v !== '--' && v !== '----') return true;
+    }
+    return false;
+}
+
+function trimFxArray(fxArr) {
+    if (!fxArr) return fxArr;
+    var last = fxArr.length - 1;
+    while (last >= 0) {
+        var v = fxArr[last];
+        if (v && v !== '--' && v !== '----') break;
+        last--;
+    }
+    fxArr.length = Math.max(0, last + 1);
+    return fxArr;
+}
+
+function removeEvent(events, eventObj) {
+    if (!events || !eventObj) return;
+    var idx = events.indexOf(eventObj);
+    if (idx >= 0) events.splice(idx, 1);
+}
+
+function findTrackerEventsAtStep(pattern, step, noteCol) {
+    var lpb = pattern.lpb || state.lpb;
+    var stepBeat = step / lpb;
+    var events = ensurePatternNotes(pattern);
+    var noteEvent = null;
+    var cellEvent = null;
+
+    for (var i = 0; i < events.length; i++) {
+        var ev = events[i];
+        if (!ev) continue;
+        if ((ev.column || 0) !== noteCol) continue;
+        if (!beatsMatch(ev.startBeat, stepBeat)) continue;
+        if (isNoteEvent(ev)) noteEvent = ev;
+        else if (isCellEvent(ev)) cellEvent = ev;
+    }
+
+    return { noteEvent: noteEvent, cellEvent: cellEvent, stepBeat: stepBeat };
+}
+
+function findNoteEndingAtStep(pattern, step, noteCol) {
+    var lpb = pattern.lpb || state.lpb;
+    var stepBeat = step / lpb;
+    var events = ensurePatternNotes(pattern);
+
+    for (var i = 0; i < events.length; i++) {
+        var ev = events[i];
+        if (!isNoteEvent(ev)) continue;
+        if ((ev.column || 0) !== noteCol) continue;
+        if (typeof ev.duration !== 'number' || ev.duration <= 0) continue;
+        var endBeat = ev.startBeat + ev.duration;
+        if (beatsMatch(endBeat, stepBeat)) return ev;
+    }
+    return null;
+}
+
+function getTrackerCellDisplay(pattern, step, noteCol) {
+    var info = findTrackerEventsAtStep(pattern, step, noteCol);
+    var noteEvent = info.noteEvent;
+    var cellEvent = info.cellEvent;
+
+    var noteName = '---';
+    var ampStr = '--';
+    var fxArr = [];
+
+    if (noteEvent) {
+        if (noteEvent.pitch !== null && noteEvent.pitch !== undefined) {
+            noteName = midiToNoteName(noteEvent.pitch);
+        }
+        ampStr = velocityToHex(noteEvent.velocity);
+        fxArr = noteEvent.fx || [];
+    } else if (cellEvent && cellEvent.note === NOTE_OFF) {
+        noteName = NOTE_OFF;
+        ampStr = cellEvent.amp || '--';
+        fxArr = cellEvent.fx || [];
+    } else if (cellEvent) {
+        ampStr = cellEvent.amp || '--';
+        fxArr = cellEvent.fx || [];
+    } else {
+        var endingNote = findNoteEndingAtStep(pattern, step, noteCol);
+        if (endingNote) {
+            noteName = NOTE_OFF;
+        }
+    }
+
+    return { noteName: noteName, ampStr: ampStr, fxArr: fxArr };
+}
+
+function getTrackerFxValue(pattern, step, noteCol, fxCol) {
+    var info = findTrackerEventsAtStep(pattern, step, noteCol);
+    var fxArr = null;
+    if (info.noteEvent && info.noteEvent.fx) fxArr = info.noteEvent.fx;
+    else if (info.cellEvent && info.cellEvent.fx) fxArr = info.cellEvent.fx;
+    if (!fxArr || fxArr.length <= fxCol) return '';
+    return fxArr[fxCol] || '';
+}
+
+function deriveTrackerNoteDurations(events, lpb) {
+    if (!events || events.length === 0) return;
+    for (var i = 0; i < events.length; i++) {
+        var ev = events[i];
+        if (!isNoteEvent(ev)) continue;
+
+        var endBeat = null;
+        for (var j = 0; j < events.length; j++) {
+            if (i === j) continue;
+            var other = events[j];
+            if ((other.column || 0) !== (ev.column || 0)) continue;
+            if (other.startBeat <= ev.startBeat) continue;
+            if (isNoteEvent(other) || (isCellEvent(other) && other.note === NOTE_OFF)) {
+                if (endBeat === null || other.startBeat < endBeat) {
+                    endBeat = other.startBeat;
+                }
+            }
+        }
+
+        if (endBeat === null) {
+            ev.duration = null;  // Indefinite unless explicitly ended in selection
+        } else {
+            var dur = endBeat - ev.startBeat;
+            ev.duration = dur > 0 ? dur : null;
+        }
+    }
+}
+
+// Create a new empty tracker pattern (step sequencer style)
 function createTrackerPattern(steps, lpb, trackId) {
     var patternNum = state.patterns ? state.patterns.length : 0;
+    var stepsVal = steps || 16;
+    var lpbVal = lpb || state.lpb;
     var pattern = {
         id: patternNum,
         name: 'Pattern ' + (patternNum + 1),
         type: 'tracker',
-        trackId: trackId || 0,    // Which track this pattern is placed on (for timeline)
-        instrument: 1,            // Which Csound instrument to use (1-128)
-        steps: steps || 16,
-        lpb: lpb || state.lpb,
-        noteColumns: 1,           // Number of note columns (each has note, amp, expandable fx)
-        data: new Array(steps || 16)
+        trackId: trackId || 0,
+        instrument: 1,
+        steps: stepsVal,
+        lpb: lpbVal,
+        beats: stepsVal / lpbVal,  // Derived from steps and lpb
+        noteColumns: 1,
+        fxColumns: [1],            // Number of FX columns per note column (p6 active by default)
+        notes: []                  // Unified notes array
     };
-    for (var step = 0; step < pattern.steps; step++) {
-        pattern.data[step] = {
-            columns: [
-                { note: '', amp: '', fx: [] }  // First note column with expandable FX
-            ]
-        };
-    }
     return pattern;
 }
 
@@ -400,14 +735,8 @@ function addNoteColumn(patternIndex) {
     if (!pattern) return;
 
     pattern.noteColumns = (pattern.noteColumns || 1) + 1;
-
-    // Add column to each step
-    for (var step = 0; step < pattern.steps; step++) {
-        if (!pattern.data[step].columns) {
-            pattern.data[step].columns = [{ note: '', amp: '', fx: [] }];
-        }
-        pattern.data[step].columns.push({ note: '', amp: '', fx: [] });
-    }
+    if (!pattern.fxColumns) pattern.fxColumns = [0];
+    pattern.fxColumns.push(0);  // New column starts with 0 FX columns
 
     markPatternDirty(patternIndex);
 }
@@ -417,13 +746,18 @@ function removeNoteColumn(patternIndex) {
     var pattern = state.patterns[patternIndex];
     if (!pattern || (pattern.noteColumns || 1) <= 1) return;
 
-    pattern.noteColumns = pattern.noteColumns - 1;
+    var removedCol = pattern.noteColumns - 1;
+    pattern.noteColumns = removedCol;
 
-    // Remove last column from each step
-    for (var step = 0; step < pattern.steps; step++) {
-        if (pattern.data[step].columns && pattern.data[step].columns.length > 1) {
-            pattern.data[step].columns.pop();
-        }
+    // Remove notes in the deleted column
+    if (pattern.notes) {
+        pattern.notes = pattern.notes.filter(function(n) {
+            return (n.column || 0) < removedCol;
+        });
+    }
+
+    if (pattern.fxColumns && pattern.fxColumns.length > removedCol) {
+        pattern.fxColumns.pop();
     }
 
     markPatternDirty(patternIndex);
@@ -434,13 +768,11 @@ function addFxColumn(patternIndex, noteColIndex) {
     var pattern = state.patterns[patternIndex];
     if (!pattern) return;
 
-    // Update each step's data
-    for (var step = 0; step < pattern.steps; step++) {
-        var col = pattern.data[step].columns[noteColIndex];
-        if (col) {
-            col.fx.push('');
-        }
+    if (!pattern.fxColumns) pattern.fxColumns = [];
+    while (pattern.fxColumns.length <= noteColIndex) {
+        pattern.fxColumns.push(0);
     }
+    pattern.fxColumns[noteColIndex]++;
 
     markPatternDirty(patternIndex);
 }
@@ -448,14 +780,18 @@ function addFxColumn(patternIndex, noteColIndex) {
 // Remove FX column from a specific note column in pattern
 function removeFxColumn(patternIndex, noteColIndex) {
     var pattern = state.patterns[patternIndex];
-    if (!pattern) return;
+    if (!pattern || !pattern.fxColumns || !pattern.fxColumns[noteColIndex]) return;
 
-    // Update each step's data
-    for (var step = 0; step < pattern.steps; step++) {
-        var col = pattern.data[step].columns[noteColIndex];
-        if (col && col.fx.length > 0) {
-            col.fx.pop();
-        }
+    pattern.fxColumns[noteColIndex]--;
+
+    // Truncate FX arrays on notes in this column
+    var fxCount = pattern.fxColumns[noteColIndex];
+    if (pattern.notes) {
+        pattern.notes.forEach(function(note) {
+            if ((note.column || 0) === noteColIndex && note.fx && note.fx.length > fxCount) {
+                note.fx.length = fxCount;
+            }
+        });
     }
 
     markPatternDirty(patternIndex);
@@ -463,23 +799,305 @@ function removeFxColumn(patternIndex, noteColIndex) {
 
 // Get FX count for a note column
 function getFxCount(pattern, noteColIndex) {
-    if (!pattern || !pattern.data || !pattern.data[0]) return 0;
-    var col = pattern.data[0].columns[noteColIndex];
-    return col ? col.fx.length : 0;
+    if (!pattern || !pattern.fxColumns) return 0;
+    return pattern.fxColumns[noteColIndex] || 0;
 }
 
-// Create a new empty piano roll pattern (MIDI-style notes, single-track)
+// ============================================
+// STEP-BASED HELPERS (for tracker view)
+// ============================================
+
+// Get note at a specific step and column (for tracker view rendering)
+function getNoteAtStep(pattern, step, column) {
+    if (!pattern || !pattern.notes) return null;
+
+    var lpb = pattern.lpb || state.lpb;
+    var stepBeat = step / lpb;
+    var stepDuration = 1 / lpb;
+
+    for (var i = 0; i < pattern.notes.length; i++) {
+        var note = pattern.notes[i];
+        if (!isNoteEvent(note)) continue;
+        if ((note.column || 0) !== column) continue;
+
+        // Check if note starts at this step
+        if (Math.abs(note.startBeat - stepBeat) < 0.001) {
+            return { note: note, index: i, isStart: true };
+        }
+
+        // Only consider duration if explicitly set and positive
+        if (typeof note.duration === 'number' && note.duration > 0) {
+            // Check if note is still sounding at this step (for showing continuation or note-off)
+            var noteEnd = note.startBeat + note.duration;
+            if (note.startBeat < stepBeat && noteEnd > stepBeat) {
+                return { note: note, index: i, isStart: false, isContinuation: true };
+            }
+
+            // Check if note ends at this step (show note-off)
+            if (Math.abs(noteEnd - stepBeat) < 0.001) {
+                return { note: note, index: i, isStart: false, isEnd: true };
+            }
+        }
+    }
+
+    return null;
+}
+
+// Set/update a note at a specific step and column
+function setNoteAtStep(pattern, step, column, noteName, velocity, fx) {
+    if (!pattern) return;
+    if (!pattern.notes) pattern.notes = [];
+
+    var lpb = pattern.lpb || state.lpb;
+    var stepBeat = step / lpb;
+    var stepDuration = 1 / lpb;
+
+    // Find existing note at this step/column
+    var existingIdx = -1;
+    for (var i = 0; i < pattern.notes.length; i++) {
+        var note = pattern.notes[i];
+        if ((note.column || 0) === column && Math.abs(note.startBeat - stepBeat) < 0.001) {
+            existingIdx = i;
+            break;
+        }
+    }
+
+    // Handle note-off or empty
+    if (!noteName || noteName === '' || noteName === '---' || noteName === NOTE_OFF) {
+        if (existingIdx >= 0) {
+            pattern.notes.splice(existingIdx, 1);
+        }
+        return;
+    }
+
+    // Convert note name to MIDI pitch
+    var pitch = noteNameToMidi(noteName);
+    if (pitch === null) return;
+
+    // Convert velocity (hex string like "FF" or decimal 0-1)
+    var vel = 1.0;
+    if (typeof velocity === 'string' && velocity.length > 0) {
+        vel = parseInt(velocity, 16) / 255;
+    } else if (typeof velocity === 'number') {
+        vel = velocity;
+    }
+
+    if (existingIdx >= 0) {
+        // Update existing note
+        pattern.notes[existingIdx].pitch = pitch;
+        pattern.notes[existingIdx].velocity = vel;
+        if (fx !== undefined) pattern.notes[existingIdx].fx = fx;
+    } else {
+        // Create new note
+        var newNote = {
+            pitch: pitch,
+            startBeat: stepBeat,
+            duration: stepDuration,
+            velocity: vel,
+            column: column,
+            fx: fx || []
+        };
+        pattern.notes.push(newNote);
+    }
+
+    markPatternNoteVizDirtyForPattern(pattern);
+}
+
+// Clear note at a specific step and column
+function clearNoteAtStep(pattern, step, column) {
+    if (!pattern || !pattern.notes) return;
+
+    var lpb = pattern.lpb || state.lpb;
+    var stepBeat = step / lpb;
+
+    for (var i = pattern.notes.length - 1; i >= 0; i--) {
+        var note = pattern.notes[i];
+        if ((note.column || 0) === column && Math.abs(note.startBeat - stepBeat) < 0.001) {
+            pattern.notes.splice(i, 1);
+            markPatternNoteVizDirtyForPattern(pattern);
+            return;
+        }
+    }
+}
+
+
+
+// Convert MIDI pitch to note name (e.g., 60 -> "C-4")
+function midiToNoteName(pitch) {
+    var noteNames = ['C-', 'C#', 'D-', 'D#', 'E-', 'F-', 'F#', 'G-', 'G#', 'A-', 'A#', 'B-'];
+    var octave = Math.floor(pitch / 12) - 1;
+    var note = pitch % 12;
+    return noteNames[note] + octave;
+}
+
+// ============================================
+// PATTERN DATA CONVERSION (for legacy compatibility)
+// ============================================
+
+// Convert tracker pattern.data to notes array
+function trackerDataToNotes(pattern) {
+    if (!pattern || !pattern.data) return [];
+
+    var notes = [];
+    var lpb = pattern.lpb || state.lpb;
+
+    for (var step = 0; step < pattern.steps; step++) {
+        var stepData = pattern.data[step];
+        if (!stepData || !stepData.columns) continue;
+
+        for (var col = 0; col < stepData.columns.length; col++) {
+            var colData = stepData.columns[col];
+            if (!colData) continue;
+
+            var stepBeat = step / lpb;
+            var noteStr = colData.note || '';
+            var ampStr = colData.amp || '';
+            var fxArr = colData.fx ? colData.fx.slice() : [];
+            var fxHasValues = hasFxValues(fxArr);
+
+            if (noteStr === NOTE_OFF) {
+                notes.push({
+                    type: 'cell',
+                    startBeat: stepBeat,
+                    column: col,
+                    note: NOTE_OFF,
+                    amp: ampStr || '',
+                    fx: fxArr
+                });
+                continue;
+            }
+
+            if (noteStr && noteStr !== '---') {
+                var pitch = noteNameToMidi(noteStr);
+                if (pitch === null) continue;
+
+                notes.push({
+                    type: 'note',
+                    pitch: pitch,
+                    startBeat: stepBeat,
+                    duration: null,  // Tracker notes are held until OFF/new note
+                    velocity: hexToVelocity(ampStr),
+                    column: col,
+                    fx: fxArr
+                });
+                continue;
+            }
+
+            // No note - preserve amp/fx as a cell event if present
+            if ((ampStr && ampStr !== '--') || fxHasValues) {
+                notes.push({
+                    type: 'cell',
+                    startBeat: stepBeat,
+                    column: col,
+                    note: '',
+                    amp: ampStr || '',
+                    fx: fxArr
+                });
+            }
+        }
+    }
+
+    return notes;
+}
+
+// Convert notes array to tracker pattern.data (for display/editing)
+function notesToTrackerData(pattern) {
+    if (!pattern) return;
+
+    var lpb = pattern.lpb || state.lpb;
+    var numNoteCols = pattern.noteColumns || 1;
+
+    // Initialize empty data structure
+    if (!pattern.data) pattern.data = [];
+    for (var step = 0; step < pattern.steps; step++) {
+        if (!pattern.data[step]) pattern.data[step] = { columns: [] };
+        if (!pattern.data[step].columns) pattern.data[step].columns = [];
+        while (pattern.data[step].columns.length < numNoteCols) {
+            pattern.data[step].columns.push({ note: '', amp: '', fx: [] });
+        }
+        // Clear existing data
+        for (var c = 0; c < numNoteCols; c++) {
+            pattern.data[step].columns[c].note = '';
+            pattern.data[step].columns[c].amp = '';
+        }
+    }
+
+    // Populate from notes/events array
+    if (!pattern.notes) return;
+
+    var noteMap = {};
+
+    // First pass: note events
+    for (var i = 0; i < pattern.notes.length; i++) {
+        var note = pattern.notes[i];
+        if (!isNoteEvent(note)) continue;
+
+        var step = Math.round(note.startBeat * lpb);
+        var col = note.column || 0;
+
+        if (step >= 0 && step < pattern.steps && col < numNoteCols) {
+            var cell = pattern.data[step].columns[col];
+            cell.note = midiToNoteName(note.pitch);
+            cell.amp = (note.velocity === null || note.velocity === undefined) ? '' : velocityToHex(note.velocity);
+            cell.fx = note.fx ? note.fx.slice() : [];
+            noteMap[step + '_' + col] = true;
+        }
+    }
+
+    // Second pass: cell events (only if no note event at that step/col)
+    for (var i = 0; i < pattern.notes.length; i++) {
+        var ev = pattern.notes[i];
+        if (!isCellEvent(ev)) continue;
+
+        var step = Math.round(ev.startBeat * lpb);
+        var col = ev.column || 0;
+        if (step < 0 || step >= pattern.steps || col < 0 || col >= numNoteCols) continue;
+
+        if (noteMap[step + '_' + col]) continue;
+
+        var cell = pattern.data[step].columns[col];
+        if (ev.note === NOTE_OFF) {
+            cell.note = NOTE_OFF;
+        }
+        if (ev.amp && ev.amp !== '--') {
+            cell.amp = ev.amp;
+        }
+        if (ev.fx && ev.fx.length > 0) {
+            cell.fx = ev.fx.slice();
+        }
+    }
+}
+
+// Sync pattern.data to pattern.notes (call when data is edited)
+function syncDataToNotes(pattern) {
+    if (!pattern) return;
+    if (pattern.type === 'piano') return;
+    pattern.notes = trackerDataToNotes(pattern);
+}
+
+// Sync pattern.notes to pattern.data (call when notes are edited)
+function syncNotesToData(pattern) {
+    if (!pattern || pattern.type === 'piano') return;
+    notesToTrackerData(pattern);
+}
+
+// Create a new empty piano roll pattern (MIDI-style, continuous view)
 function createPianoPattern(beats, lpb, trackId) {
     var patternNum = state.patterns ? state.patterns.length : 0;
+    var beatsVal = beats || 4;
+    var lpbVal = lpb || state.lpb;
     var pattern = {
         id: patternNum,
         name: 'Piano ' + (patternNum + 1),
-        type: 'piano',            // 'tracker' or 'piano'
-        trackId: trackId || 0,    // Which track this pattern belongs to
-        beats: beats || 4,        // Length in beats
-        lpb: lpb || state.lpb,
-        instrument: 1,            // Default instrument
-        notes: []                 // Array of { pitch, startBeat, duration, velocity }
+        type: 'piano',
+        trackId: trackId || 0,
+        beats: beatsVal,
+        lpb: lpbVal,
+        steps: beatsVal * lpbVal,  // Derived for compatibility
+        instrument: 1,
+        noteColumns: 1,            // Piano roll typically uses 1 column
+        fxColumns: [0],
+        notes: []                  // Unified notes array
     };
     return pattern;
 }
@@ -505,12 +1123,14 @@ function addClipToTrack(trackId, patternId, startBeat, loopCount) {
         actualStartBeat = snapToMeasureStart(actualStartBeat);
     }
 
+    var pattern = state.patterns[patternId];
     var clip = {
         id: Date.now() + Math.random(),  // Unique clip ID
         patternId: patternId,
         startBeat: actualStartBeat,
         loopCount: loopCount || 1,
-        offset: 0  // Offset into pattern in beats (for split clips)
+        offset: 0,  // Offset into pattern in beats (for split clips)
+        loopLength: pattern ? getPatternBeatsValue(pattern) : null
     };
 
     state.tracks[trackId].clips.push(clip);
@@ -543,11 +1163,30 @@ function getClipDurationBeats(clip) {
     var patternBeats;
     if (pattern.type === 'piano') {
         patternBeats = pattern.beats || 4;
+
+        // Use recording preview if this is the selected clip during recording
+        if (state.isRecording && recordingPreviewBeats > patternBeats) {
+            var selectedClip = getSelectedClip();
+            if (selectedClip && selectedClip.id === clip.id) {
+                patternBeats = recordingPreviewBeats;
+            }
+        }
     } else {
         var patternLpb = pattern.lpb || state.lpb;
         patternBeats = pattern.steps / patternLpb;
     }
-    return patternBeats * clip.loopCount - (clip.offset || 0);
+    var loopCount = (clip.loopCount !== undefined && clip.loopCount !== null) ? clip.loopCount : 1;
+    if (clip.loopLength !== undefined && clip.loopLength !== null) {
+        return Math.max(0, clip.loopLength * loopCount);
+    }
+    var duration = patternBeats * loopCount - (clip.offset || 0);
+    return Math.max(0, duration);
+}
+
+function getClipLoopLength(clip, pattern) {
+    if (!clip || !pattern) return 0;
+    if (clip.loopLength !== undefined && clip.loopLength !== null) return clip.loopLength;
+    return getPatternBeatsValue(pattern);
 }
 
 // Get the raw pattern length in beats (ignoring loop/offset)
@@ -562,6 +1201,360 @@ function getPatternBeats(clip) {
 // Get clip end beat
 function getClipEndBeat(clip) {
     return clip.startBeat + getClipDurationBeats(clip);
+}
+
+function getPatternBeatsValue(pattern) {
+    if (!pattern) return 0;
+    if (pattern.type === 'piano') return pattern.beats || 4;
+    var lpb = pattern.lpb || state.lpb;
+    return (pattern.steps || 0) / lpb;
+}
+
+function quantizeBeatToLpb(beat, lpb) {
+    var grid = lpb || state.lpb;
+    if (!grid) return beat;
+    return Math.round(beat * grid) / grid;
+}
+
+function cloneEvent(ev) {
+    return JSON.parse(JSON.stringify(ev));
+}
+
+function getPatternEventsWithDurations(pattern) {
+    if (!pattern || !pattern.notes) return [];
+
+    var events = pattern.notes.map(function(ev) { return cloneEvent(ev); });
+    var lpb = pattern.lpb || state.lpb;
+
+    if (pattern.type !== 'piano') {
+        deriveTrackerNoteDurations(events, lpb);
+        var patternBeats = getPatternBeatsValue(pattern);
+        for (var i = 0; i < events.length; i++) {
+            var ev = events[i];
+            if (!isNoteEvent(ev)) continue;
+            if (typeof ev.duration !== 'number' || ev.duration <= 0) {
+                var dur = patternBeats - ev.startBeat;
+                ev.duration = dur > 0 ? dur : (1 / lpb);
+            }
+        }
+    } else {
+        for (var j = 0; j < events.length; j++) {
+            var pEv = events[j];
+            if (!isNoteEvent(pEv)) continue;
+            if (typeof pEv.duration !== 'number' || pEv.duration <= 0) {
+                pEv.duration = 1 / lpb;
+            }
+        }
+    }
+
+    return events;
+}
+
+function collectClipEventsForSegment(pattern, clip, segStart, segEnd) {
+    if (!pattern || !clip) return [];
+    if (segEnd <= segStart) return [];
+
+    var patternBeats = getPatternBeatsValue(pattern);
+    if (patternBeats <= 0) return [];
+
+    var offset = clip.offset || 0;
+    var events = getPatternEventsWithDurations(pattern);
+    var result = [];
+
+    // New loopLength-based behavior (non-destructive trim)
+    if (clip.loopLength !== undefined && clip.loopLength !== null) {
+        var loopLength = clip.loopLength;
+        if (loopLength <= 0) return [];
+
+        var loopStart = offset;
+        var loopEnd = loopStart + loopLength;
+        var wraps = loopEnd > patternBeats;
+        var wrapEnd = loopEnd - patternBeats;
+
+        function getLocalStart(evStart) {
+            if (!wraps) {
+                if (evStart < loopStart || evStart >= loopEnd) return null;
+                return evStart - loopStart;
+            }
+            if (evStart >= loopStart && evStart < patternBeats) {
+                return evStart - loopStart;
+            }
+            if (evStart >= 0 && evStart < wrapEnd) {
+                return (patternBeats - loopStart) + evStart;
+            }
+            return null;
+        }
+
+        for (var i = 0; i < events.length; i++) {
+            var ev = events[i];
+            if (!ev) continue;
+            var localStart = getLocalStart(ev.startBeat);
+            if (localStart === null) continue;
+
+            var isNote = isNoteEvent(ev);
+            var evDur = isNote ? (ev.duration || 0) : 0;
+            var maxDur = loopLength - localStart;
+            if (isNote && evDur > maxDur) evDur = maxDur;
+
+            var kStart = Math.floor((segStart - localStart) / loopLength) - 1;
+            var kEnd = Math.floor((segEnd - localStart) / loopLength) + 1;
+
+            for (var k = kStart; k <= kEnd; k++) {
+                var evStart = localStart + (k * loopLength);
+                if (isNote) {
+                    var evEnd = evStart + evDur;
+                    if (evEnd <= segStart || evStart >= segEnd) continue;
+
+                    var newStart = Math.max(evStart, segStart);
+                    var newEnd = Math.min(evEnd, segEnd);
+                    var newDur = newEnd - newStart;
+                    if (newDur <= 0) continue;
+
+                    var newNote = cloneEvent(ev);
+                    newNote.startBeat = newStart - segStart;
+                    newNote.duration = newDur;
+                    result.push(newNote);
+                } else if (isCellEvent(ev)) {
+                    if (evStart < segStart || evStart >= segEnd) continue;
+                    var newCell = cloneEvent(ev);
+                    newCell.startBeat = evStart - segStart;
+                    result.push(newCell);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    // Legacy offset/loopCount behavior
+    for (var j = 0; j < events.length; j++) {
+        var lev = events[j];
+        if (!lev) continue;
+
+        var isNoteLegacy = isNoteEvent(lev);
+        var levDur = isNoteLegacy ? (lev.duration || 0) : 0;
+
+        var kStartLegacy = Math.floor((segStart + offset - lev.startBeat - levDur) / patternBeats) - 1;
+        var kEndLegacy = Math.floor((segEnd + offset - lev.startBeat) / patternBeats) + 1;
+
+        for (var k2 = kStartLegacy; k2 <= kEndLegacy; k2++) {
+            var levStart = lev.startBeat - offset + (k2 * patternBeats);
+            if (isNoteLegacy) {
+                var levEnd = levStart + levDur;
+                if (levEnd <= segStart || levStart >= segEnd) continue;
+
+                var newStartLegacy = Math.max(levStart, segStart);
+                var newEndLegacy = Math.min(levEnd, segEnd);
+                var newDurLegacy = newEndLegacy - newStartLegacy;
+                if (newDurLegacy <= 0) continue;
+
+                var newNoteLegacy = cloneEvent(lev);
+                newNoteLegacy.startBeat = newStartLegacy - segStart;
+                newNoteLegacy.duration = newDurLegacy;
+                result.push(newNoteLegacy);
+            } else if (isCellEvent(lev)) {
+                if (levStart < segStart || levStart >= segEnd) continue;
+                var newCellLegacy = cloneEvent(lev);
+                newCellLegacy.startBeat = levStart - segStart;
+                result.push(newCellLegacy);
+            }
+        }
+    }
+
+    return result;
+}
+
+function normalizeTrackerSegmentEvents(events, segmentBeats, lpb) {
+    var grid = lpb || state.lpb;
+    var maxBeat = segmentBeats;
+    var normalized = [];
+    var occupied = {};
+
+    for (var i = 0; i < events.length; i++) {
+        var ev = events[i];
+        if (!ev) continue;
+
+        var start = quantizeBeatToLpb(ev.startBeat, grid);
+        if (start < 0 || start >= maxBeat) continue;
+        var col = ev.column || 0;
+
+        if (isNoteEvent(ev)) {
+            var end = quantizeBeatToLpb(ev.startBeat + ev.duration, grid);
+            if (end <= start) continue;
+            if (end > maxBeat) end = maxBeat;
+            var dur = end - start;
+            if (dur <= 0) continue;
+            ev.startBeat = start;
+            ev.duration = dur;
+            normalized.push(ev);
+        } else if (isCellEvent(ev)) {
+            ev.startBeat = start;
+            normalized.push(ev);
+        }
+
+        var stepKey = Math.round(start * grid) + '_' + col;
+        occupied[stepKey] = true;
+    }
+
+    // Add note-off events at note ends (if not already present)
+    for (var j = 0; j < normalized.length; j++) {
+        var note = normalized[j];
+        if (!isNoteEvent(note)) continue;
+        if (typeof note.duration !== 'number' || note.duration <= 0) continue;
+        var endBeat = note.startBeat + note.duration;
+        if (endBeat >= maxBeat - 0.0001) continue;
+
+        var endStep = Math.round(endBeat * grid);
+        var endKey = endStep + '_' + (note.column || 0);
+        if (occupied[endKey]) continue;
+
+        normalized.push({
+            type: 'cell',
+            startBeat: endStep / grid,
+            column: note.column || 0,
+            note: NOTE_OFF,
+            amp: '',
+            fx: []
+        });
+        occupied[endKey] = true;
+    }
+
+    return normalized;
+}
+
+function buildPatternFromClipSegment(pattern, clip, segStart, segDuration) {
+    if (!pattern || !clip) return null;
+    if (segDuration <= 0) return null;
+
+    var lpb = pattern.lpb || state.lpb;
+    var minBeats = (pattern.type === 'piano') ? 0.0001 : (1 / lpb);
+    var segStartBeat = segStart;
+    var segEndBeat = segStart + segDuration;
+
+    if (pattern.type !== 'piano') {
+        segStartBeat = quantizeBeatToLpb(segStartBeat, lpb);
+        segEndBeat = quantizeBeatToLpb(segEndBeat, lpb);
+        if (segEndBeat <= segStartBeat) {
+            segEndBeat = segStartBeat + minBeats;
+        }
+    }
+
+    var segLen = Math.max(minBeats, segEndBeat - segStartBeat);
+    var events = collectClipEventsForSegment(pattern, clip, segStartBeat, segStartBeat + segLen);
+
+    var newPattern;
+    if (pattern.type === 'piano') {
+        newPattern = createPianoPattern(segLen, lpb, pattern.trackId);
+    } else {
+        var steps = Math.max(1, Math.round(segLen * lpb));
+        newPattern = createTrackerPattern(steps, lpb, pattern.trackId);
+        segLen = steps / lpb;
+        events = normalizeTrackerSegmentEvents(events, segLen, lpb);
+    }
+
+    newPattern.instrument = pattern.instrument || 1;
+    newPattern.noteColumns = pattern.noteColumns || 1;
+    newPattern.fxColumns = pattern.fxColumns ? pattern.fxColumns.slice() : [0];
+    newPattern.name = pattern.name || newPattern.name;
+    newPattern.notes = events;
+
+    if (newPattern.type !== 'piano') {
+        syncNotesToData(newPattern);
+    }
+
+    return newPattern;
+}
+
+function addPatternToLibrary(pattern) {
+    if (!pattern) return -1;
+    pattern.id = state.patterns.length;
+    state.patterns.push(pattern);
+    return pattern.id;
+}
+
+function bakeClipToNewPattern(clip) {
+    if (!clip) return -1;
+    var pattern = state.patterns[clip.patternId];
+    if (!pattern) return -1;
+    var duration = getClipDurationBeats(clip);
+    if (duration <= 0) return -1;
+    var baked = buildPatternFromClipSegment(pattern, clip, 0, duration);
+    if (!baked) return -1;
+    return addPatternToLibrary(baked);
+}
+
+function cleanupUnusedPatterns() {
+    var used = {};
+    for (var t = 0; t < state.tracks.length; t++) {
+        var track = state.tracks[t];
+        for (var c = 0; c < track.clips.length; c++) {
+            used[track.clips[c].patternId] = true;
+        }
+    }
+
+    var map = {};
+    var newPatterns = [];
+    for (var i = 0; i < state.patterns.length; i++) {
+        var p = state.patterns[i];
+        if (!p || !used[i]) continue;
+        var newIdx = newPatterns.length;
+        map[i] = newIdx;
+        p.id = newIdx;
+        newPatterns.push(p);
+    }
+
+    // Update clips to new pattern indices; drop clips pointing to missing patterns
+    for (var t2 = 0; t2 < state.tracks.length; t2++) {
+        var clips = state.tracks[t2].clips;
+        for (var ci = clips.length - 1; ci >= 0; ci--) {
+            var oldId = clips[ci].patternId;
+            if (map[oldId] === undefined) {
+                clips.splice(ci, 1);
+                continue;
+            }
+            clips[ci].patternId = map[oldId];
+        }
+    }
+
+    // Update clip clipboard pattern references
+    if (clipboardClip) {
+        if (map[clipboardClip.patternId] !== undefined) {
+            clipboardClip.patternId = map[clipboardClip.patternId];
+        } else {
+            clipboardClip = null;
+        }
+    }
+    if (clipboardClips && clipboardClips.clips) {
+        var filtered = [];
+        for (var cc = 0; cc < clipboardClips.clips.length; cc++) {
+            var clipData = clipboardClips.clips[cc];
+            if (map[clipData.patternId] !== undefined) {
+                clipData.patternId = map[clipData.patternId];
+                filtered.push(clipData);
+            }
+        }
+        clipboardClips.clips = filtered;
+        if (filtered.length === 0) {
+            clipboardClips = null;
+        } else {
+            var minBeat = Infinity;
+            var minTrack = Infinity;
+            for (var f = 0; f < filtered.length; f++) {
+                if (filtered[f].startBeat < minBeat) minBeat = filtered[f].startBeat;
+                if (filtered[f].trackId < minTrack) minTrack = filtered[f].trackId;
+            }
+            clipboardClips.minBeat = minBeat;
+            clipboardClips.minTrack = minTrack;
+        }
+    }
+
+    state.patterns = newPatterns;
+    invalidatePatternCache();
+    patternNoteVizDirty = {};
+    if (pendingNoteVizRefresh) {
+        cancelAnimationFrame(pendingNoteVizRefresh);
+        pendingNoteVizRefresh = null;
+    }
 }
 
 // Find all clips active at a given beat position
@@ -609,24 +1602,37 @@ function beatToPatternStep(clip, beat) {
     var pattern = state.patterns[clip.patternId];
     if (!pattern) return { step: -1, loopCount: 0 };
 
-    var localBeat = beat - clip.startBeat + (clip.offset || 0);
+    var localBeat = beat - clip.startBeat;
     if (localBeat < 0) return { step: -1, loopCount: 0 };
 
     var patternLpb = pattern.lpb || state.lpb;
     var patternBeats = pattern.steps / patternLpb;
 
-    // Calculate which loop iteration we're in
-    var loopCount = Math.floor(localBeat / patternBeats);
-
-    // Check if we've exceeded the clip's loopCount (fractional loops)
+    // Check if we've exceeded the clip's length
     var clipDuration = getClipDurationBeats(clip);
-    if ((beat - clip.startBeat) >= clipDuration) return { step: -1, loopCount: loopCount };
+    if (localBeat >= clipDuration) return { step: -1, loopCount: 0 };
 
-    // Handle looping: wrap local beat within pattern length
-    var loopBeat = localBeat % patternBeats;
-    var step = Math.floor(loopBeat * patternLpb);
+    // LoopLength-based trim
+    if (clip.loopLength !== undefined && clip.loopLength !== null) {
+        var loopLength = clip.loopLength;
+        if (loopLength <= 0) return { step: -1, loopCount: 0 };
 
-    return { step: Math.min(step, pattern.steps - 1), loopCount: loopCount };
+        var loopCount = Math.floor(localBeat / loopLength);
+        var loopBeat = localBeat % loopLength;
+        var patternBeat = (clip.offset || 0) + loopBeat;
+        if (patternBeat >= patternBeats) patternBeat -= patternBeats;
+
+        var step = Math.floor(patternBeat * patternLpb);
+        return { step: Math.min(step, pattern.steps - 1), loopCount: loopCount };
+    }
+
+    // Legacy offset behavior
+    localBeat = localBeat + (clip.offset || 0);
+    var legacyLoopCount = Math.floor(localBeat / patternBeats);
+    var legacyLoopBeat = localBeat % patternBeats;
+    var legacyStep = Math.floor(legacyLoopBeat * patternLpb);
+
+    return { step: Math.min(legacyStep, pattern.steps - 1), loopCount: legacyLoopCount };
 }
 
 // Get the currently selected clip
@@ -681,6 +1687,38 @@ function snapToMeasureStart(beat) {
 function snapToMeasureEnd(beat) {
     var beatsPerMeasure = getBeatsPerMeasure();
     return Math.ceil(beat / beatsPerMeasure) * beatsPerMeasure;
+}
+
+function ensureTimelineDefaults() {
+    if (!state.timeline) state.timeline = {};
+    if (state.timeline.snapToMeasure === undefined) state.timeline.snapToMeasure = true;
+    if (state.timeline.gridSnap === undefined) state.timeline.gridSnap = 1;
+    if (!state.timeline.gridSnapOptions || state.timeline.gridSnapOptions.length === 0) {
+        state.timeline.gridSnapOptions = [
+            { label: '1/256', beats: 1/64 },
+            { label: '1/128', beats: 1/32 },
+            { label: '1/64', beats: 1/16 },
+            { label: '1/32', beats: 1/8 },
+            { label: '1/16', beats: 1/4 },
+            { label: '1/8', beats: 1/2 },
+            { label: '1/4', beats: 1 },
+            { label: '1/2', beats: 2 },
+            { label: '1 Bar', beats: 4 }
+        ];
+    }
+    if (state.timeline.loopEnabled === undefined) state.timeline.loopEnabled = false;
+    if (state.timeline.loopStart === undefined) state.timeline.loopStart = 0;
+    if (state.timeline.loopEnd === undefined) state.timeline.loopEnd = 16;
+    if (state.timeline.totalBeats === undefined) state.timeline.totalBeats = 64;
+    if (state.timeline.totalMeasures === undefined) {
+        state.timeline.totalMeasures = beatsToMeasures(state.timeline.totalBeats);
+    }
+    if (state.timeline.cursorBeat === undefined) {
+        state.timeline.cursorBeat = state.currentBeat || 0;
+    }
+    if (state.timeline.cursorTrack === undefined) {
+        state.timeline.cursorTrack = state.selectedTrack || 0;
+    }
 }
 
 // Get current measure count based on clip positions
@@ -870,6 +1908,7 @@ var timelinePixelsPerBeat = 30;
 
 // Clip clipboard for copy/cut/paste
 var clipboardClip = null;
+var clipboardClips = null;
 
 function renderTimeline() {
     var container = document.getElementById('timeline-tracks');
@@ -883,6 +1922,30 @@ function renderTimeline() {
     // Auto-extend timeline based on clips (measure-aligned)
     autoExtendTimeline();
     var totalBeats = state.timeline.totalBeats;
+    if (state.isRecording && recordingPreviewBeats > 0) {
+        var selClip = getSelectedClip();
+        if (selClip && (selClip.loopCount === undefined || selClip.loopCount <= 1.0001)) {
+            var selPattern = state.patterns[selClip.patternId];
+            if (selPattern && selPattern.type === 'piano') {
+                var baseLoopLen = getClipLoopLength(selClip, selPattern);
+                var previewBeats = Math.max(baseLoopLen, recordingPreviewBeats);
+                if (previewBeats > baseLoopLen + 0.0001) {
+                    var previewClip = {
+                        patternId: selClip.patternId,
+                        startBeat: selClip.startBeat,
+                        loopCount: 1,
+                        loopLength: previewBeats,
+                        offset: selClip.offset || 0
+                    };
+                    var previewDuration = getClipDurationBeats(previewClip);
+                    var previewEnd = selClip.startBeat + previewDuration;
+                    if (previewEnd > totalBeats) {
+                        totalBeats = snapToMeasureEnd(previewEnd);
+                    }
+                }
+            }
+        }
+    }
 
     var totalWidth = totalBeats * timelinePixelsPerBeat;
 
@@ -957,15 +2020,6 @@ function renderTimeline() {
         content.appendChild(row);
     }
 
-    // Render arrangement end marker (snapped to measure boundary after last clip)
-    var maxClipEnd = getMaxClipEndBeat();
-    var arrangementEnd = maxClipEnd > 0 ? snapToMeasureEnd(maxClipEnd) : measuresToBeats(4);
-    var arrangementMarker = document.createElement('div');
-    arrangementMarker.className = 'timeline-arrangement-end';
-    arrangementMarker.style.left = (arrangementEnd * timelinePixelsPerBeat) + 'px';
-    arrangementMarker.title = 'Arrangement end (Measure ' + beatsToMeasures(arrangementEnd) + ')';
-    content.appendChild(arrangementMarker);
-
     // Render song end marker (draggable)
     var endMarker = document.createElement('div');
     endMarker.className = 'timeline-end-marker';
@@ -984,6 +2038,8 @@ function renderTimeline() {
 
     // Add content wrapper to container
     container.appendChild(content);
+
+    updateClipSelectionVisuals(selectedClips);
 
     // Render ruler
     renderTimelineRuler();
@@ -1009,22 +2065,390 @@ function getMaxClipEndBeat() {
     return maxEnd;
 }
 
+function clipKey(trackId, clipId) {
+    return trackId + '_' + clipId;
+}
+
+function isClipSelected(trackId, clipId) {
+    for (var i = 0; i < selectedClips.length; i++) {
+        if (selectedClips[i].trackId === trackId && selectedClips[i].clipId === clipId) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function updateClipSelectionVisuals(clips) {
+    var selectedMap = {};
+    for (var i = 0; i < clips.length; i++) {
+        selectedMap[clipKey(clips[i].trackId, clips[i].clipId)] = true;
+    }
+
+    var clipEls = document.querySelectorAll('.timeline-clip');
+    for (var j = 0; j < clipEls.length; j++) {
+        var el = clipEls[j];
+        var t = parseInt(el.getAttribute('data-track-id'));
+        var c = parseFloat(el.getAttribute('data-clip-id'));
+        if (selectedMap[clipKey(t, c)]) {
+            el.classList.add('selected');
+        } else {
+            el.classList.remove('selected');
+        }
+    }
+}
+
+function setPrimaryClip(trackId, clipId) {
+    state.selectedClip = { trackId: trackId, clipId: clipId };
+    state.selectedTrack = trackId;
+    state.focusedTrack = trackId;
+
+    var track = state.tracks[trackId];
+    var clip = null;
+    if (track) {
+        for (var i = 0; i < track.clips.length; i++) {
+            if (track.clips[i].id === clipId) {
+                clip = track.clips[i];
+                break;
+            }
+        }
+    }
+
+    if (clip) {
+        var pattern = state.patterns[clip.patternId];
+        if (pattern) {
+            updatePatternPianoTitle(trackId, pattern);
+
+            var trackerContainer = document.getElementById('tracker-container');
+            var pianoContainer = document.getElementById('piano-roll-container');
+            var patternEditorArea = document.getElementById('pattern-editor-area');
+
+            if (pattern.type === 'piano') {
+                if (trackerContainer) trackerContainer.classList.add('hidden');
+                if (pianoContainer) pianoContainer.classList.remove('hidden');
+                if (patternEditorArea) patternEditorArea.classList.add('piano-mode');
+                updatePianoInstrumentSelector();
+                scheduleRenderPianoRoll();
+            } else {
+                if (trackerContainer) trackerContainer.classList.remove('hidden');
+                if (pianoContainer) pianoContainer.classList.add('hidden');
+                if (patternEditorArea) patternEditorArea.classList.remove('piano-mode');
+                renderTrackerGrid(true);
+            }
+        }
+    }
+
+    renderTrackList();
+}
+
+function applyClipSelection(clips, primary) {
+    selectedClips = [];
+    var seen = {};
+    for (var i = 0; i < clips.length; i++) {
+        var key = clipKey(clips[i].trackId, clips[i].clipId);
+        if (seen[key]) continue;
+        seen[key] = true;
+        selectedClips.push({ trackId: clips[i].trackId, clipId: clips[i].clipId });
+    }
+
+    updateClipSelectionVisuals(selectedClips);
+
+    if (!primary && selectedClips.length > 0) {
+        primary = selectedClips[0];
+    }
+
+    if (primary) {
+        setPrimaryClip(primary.trackId, primary.clipId);
+    } else {
+        state.selectedClip = { trackId: null, clipId: null };
+        renderTrackList();
+    }
+}
+
+function findClipById(trackId, clipId) {
+    var track = state.tracks[trackId];
+    if (!track) return null;
+    for (var i = 0; i < track.clips.length; i++) {
+        if (track.clips[i].id === clipId) return track.clips[i];
+    }
+    return null;
+}
+
+function getClipExpandInfo(clip, pattern) {
+    var info = {
+        show: false,
+        expanded: false,
+        patternBeats: 0,
+        clipLength: 0,
+        bufferBeats: null,
+        hasBuffer: false
+    };
+    if (!clip || !pattern) return info;
+
+    var loopCount = (clip.loopCount !== undefined && clip.loopCount !== null) ? clip.loopCount : 1;
+    if (loopCount > 1.0001) return info;
+
+    var patternBeats = getPatternBeatsValue(pattern);
+    var clipLength = (clip.loopLength !== undefined && clip.loopLength !== null) ? clip.loopLength : patternBeats;
+    var bufferBeats = (pattern._bufferBeats !== undefined && pattern._bufferBeats !== null) ? pattern._bufferBeats : null;
+    var hasBuffer = bufferBeats !== null && bufferBeats > patternBeats + 0.0001;
+
+    info.patternBeats = patternBeats;
+    info.clipLength = clipLength;
+    info.bufferBeats = bufferBeats;
+    info.hasBuffer = hasBuffer;
+    info.show = true;
+    info.expanded = hasBuffer;
+    return info;
+}
+
+function cloneNotesArray(notes) {
+    var out = [];
+    if (!notes) return out;
+    for (var i = 0; i < notes.length; i++) {
+        if (!notes[i]) continue;
+        out.push(cloneEvent(notes[i]));
+    }
+    return out;
+}
+
+function scaleEventsByRatio(events, ratio) {
+    if (!events || Math.abs(ratio - 1) < 0.000001) return;
+    for (var i = 0; i < events.length; i++) {
+        var ev = events[i];
+        if (!ev) continue;
+        if (typeof ev.startBeat === 'number') {
+            ev.startBeat *= ratio;
+        }
+        if (isNoteEvent(ev) && typeof ev.duration === 'number' && ev.duration > 0) {
+            ev.duration *= ratio;
+        }
+    }
+}
+
+function setPatternLengthFromBeats(pattern, beats) {
+    if (!pattern) return;
+    var length = Math.max(0, beats || 0);
+    if (pattern.type === 'piano') {
+        pattern.beats = length;
+        return;
+    }
+    var lpb = pattern.lpb || state.lpb;
+    var steps = Math.max(1, Math.round(length * lpb));
+    pattern.steps = steps;
+    pattern.beats = steps / lpb;
+}
+
+function isBeatInSegment(beat, offset, length, totalBeats) {
+    if (length <= 0 || totalBeats <= 0) return false;
+    var end = offset + length;
+    if (end <= totalBeats) {
+        return beat >= offset && beat < end;
+    }
+    var wrapEnd = end - totalBeats;
+    return beat >= offset || beat < wrapEnd;
+}
+
+function mapBeatToBuffer(beat, offset, totalBeats) {
+    var mapped = offset + beat;
+    if (totalBeats > 0 && mapped >= totalBeats) {
+        mapped -= totalBeats;
+    }
+    return mapped;
+}
+
+function mergeContractedNotesIntoBuffer(bufferNotes, bufferBeats, contractedNotes, offset, length) {
+    var merged = [];
+    var baseNotes = bufferNotes || [];
+    var viewNotes = contractedNotes || [];
+
+    for (var i = 0; i < baseNotes.length; i++) {
+        var ev = baseNotes[i];
+        if (!ev) continue;
+        var beat = (typeof ev.startBeat === 'number') ? ev.startBeat : 0;
+        if (!isBeatInSegment(beat, offset, length, bufferBeats)) {
+            merged.push(cloneEvent(ev));
+        }
+    }
+
+    for (var j = 0; j < viewNotes.length; j++) {
+        var cv = viewNotes[j];
+        if (!cv) continue;
+        var mapped = cloneEvent(cv);
+        var start = (typeof mapped.startBeat === 'number') ? mapped.startBeat : 0;
+        mapped.startBeat = mapBeatToBuffer(start, offset, bufferBeats);
+        merged.push(mapped);
+    }
+
+    return merged;
+}
+
+function buildBufferPattern(pattern, bufferNotes, bufferBeats) {
+    var lpb = pattern.lpb || state.lpb;
+    var steps = Math.max(1, Math.round(bufferBeats * lpb));
+    return {
+        type: pattern.type,
+        notes: bufferNotes || [],
+        beats: bufferBeats,
+        lpb: pattern.lpb,
+        steps: steps
+    };
+}
+
+function applyPatternLengthWithBuffer(pattern, clip, newBeats) {
+    if (!pattern) return false;
+    var currentBeats = getPatternBeatsValue(pattern);
+    var lpb = pattern.lpb || state.lpb;
+    var grid = 1 / lpb;
+    var targetBeats = Math.max(grid, Math.round(newBeats / grid) * grid);
+    if (Math.abs(targetBeats - currentBeats) < 0.0001) return false;
+
+    var offset = clip ? (clip.offset || 0) : 0;
+
+    if (targetBeats < currentBeats - 0.0001) {
+        if (!pattern._bufferNotes || !pattern._bufferBeats) {
+            pattern._bufferNotes = cloneNotesArray(pattern.notes || []);
+            pattern._bufferBeats = currentBeats;
+        } else {
+            pattern._bufferNotes = mergeContractedNotesIntoBuffer(
+                pattern._bufferNotes,
+                pattern._bufferBeats,
+                pattern.notes || [],
+                offset,
+                currentBeats
+            );
+        }
+
+        var bufferPattern = buildBufferPattern(pattern, pattern._bufferNotes, pattern._bufferBeats);
+        var tempClip = { patternId: 0, offset: offset, loopLength: targetBeats, loopCount: 1 };
+        pattern.notes = collectClipEventsForSegment(bufferPattern, tempClip, 0, targetBeats);
+        setPatternLengthFromBeats(pattern, targetBeats);
+    } else {
+        if (pattern._bufferNotes && pattern._bufferBeats) {
+            pattern._bufferNotes = mergeContractedNotesIntoBuffer(
+                pattern._bufferNotes,
+                pattern._bufferBeats,
+                pattern.notes || [],
+                offset,
+                currentBeats
+            );
+
+            if (targetBeats <= pattern._bufferBeats + 0.0001) {
+                var bufferPatternExpand = buildBufferPattern(pattern, pattern._bufferNotes, pattern._bufferBeats);
+                var tempClipExpand = { patternId: 0, offset: offset, loopLength: targetBeats, loopCount: 1 };
+                pattern.notes = collectClipEventsForSegment(bufferPatternExpand, tempClipExpand, 0, targetBeats);
+            } else {
+                pattern.notes = cloneNotesArray(pattern._bufferNotes);
+            }
+        }
+
+        setPatternLengthFromBeats(pattern, targetBeats);
+
+        if (pattern._bufferBeats && targetBeats >= pattern._bufferBeats - 0.0001) {
+            pattern._bufferNotes = undefined;
+            pattern._bufferBeats = undefined;
+        }
+    }
+
+    if (clip) {
+        var updatedBeats = getPatternBeatsValue(pattern);
+        clip.loopLength = updatedBeats;
+        clip.loopCount = 1;
+        if (clip.offset) {
+            clip.offset = updatedBeats > 0 ? (clip.offset % updatedBeats) : 0;
+        }
+    }
+
+    var patternIndex = getPatternIndex(pattern);
+    if (patternIndex >= 0) {
+        markPatternNoteVizDirty(patternIndex);
+        if (pattern.type !== 'piano') {
+            pattern._needsGridRefresh = true;
+        }
+    }
+
+    return true;
+}
+
+function toggleClipExpand(trackId, clipId) {
+    var clip = findClipById(trackId, clipId);
+    if (!clip) return;
+    var pattern = state.patterns[clip.patternId];
+    if (!pattern) return;
+
+    var info = getClipExpandInfo(clip, pattern);
+    if (!info.show) return;
+    if (info.patternBeats <= 0) return;
+
+    if (info.hasBuffer) {
+        applyPatternLengthWithBuffer(pattern, clip, info.bufferBeats);
+    } else {
+        applyPatternLengthWithBuffer(pattern, clip, info.clipLength);
+    }
+
+    var patternIndex = getPatternIndex(pattern);
+    if (pattern.type !== 'piano') {
+        invalidatePatternCache(patternIndex);
+    }
+    markPatternNoteVizDirty(patternIndex);
+
+    renderTimeline();
+    if (state.selectedClip && state.selectedClip.clipId === clip.id && state.selectedClip.trackId === trackId) {
+        setPrimaryClip(trackId, clip.id);
+    }
+}
+
+function shouldShowExpandHandle(clip, pattern) {
+    var info = getClipExpandInfo(clip, pattern);
+    return info.show;
+}
+
 function createClipElement(clip, trackId) {
     var pattern = state.patterns[clip.patternId];
-    var duration = getClipDurationBeats(clip);
+    var renderClip = clip;
+    if (state.isRecording && recordingPreviewBeats > 0 && pattern && pattern.type === 'piano') {
+        var selectedClip = getSelectedClip();
+        if (selectedClip && selectedClip.id === clip.id &&
+            (clip.loopCount === undefined || clip.loopCount <= 1.0001)) {
+            var baseLoopLen = getClipLoopLength(clip, pattern);
+            var previewBeats = Math.max(baseLoopLen, recordingPreviewBeats);
+            if (previewBeats > baseLoopLen + 0.0001) {
+                renderClip = Object.assign({}, clip, { loopLength: previewBeats, loopCount: 1 });
+            }
+        }
+    }
+
+    var duration = getClipDurationBeats(renderClip);
     var clipWidth = duration * timelinePixelsPerBeat - 2;
+    if (clipWidth < 2) clipWidth = 2;
 
     var el = document.createElement('div');
     el.className = 'timeline-clip';
     el.setAttribute('data-clip-id', clip.id);
     el.setAttribute('data-track-id', trackId);
+    el.setAttribute('data-pattern-id', clip.patternId);
     el.style.left = (clip.startBeat * timelinePixelsPerBeat) + 'px';
     el.style.width = clipWidth + 'px';
+
+    if (isClipSelected(trackId, clip.id)) {
+        el.classList.add('selected');
+    }
+    var expandInfo = getClipExpandInfo(clip, pattern);
+    if (expandInfo.expanded) {
+        el.classList.add('expanded');
+    }
 
     // Color based on pattern type
     if (pattern && pattern.type === 'piano') {
         el.style.background = 'linear-gradient(180deg, #6c63ff 0%, #4a42d4 100%)';
         el.classList.add('piano-clip');
+
+        // Add recording preview indicator if this clip is being expanded
+        if (state.isRecording && recordingPreviewBeats > 0) {
+            var selectedClip = getSelectedClip();
+            if (selectedClip && selectedClip.id === clip.id) {
+                el.classList.add('recording-preview');
+            }
+        }
     } else {
         el.style.background = 'linear-gradient(180deg, #4ecca3 0%, #3ba888 100%)';
         el.classList.add('tracker-clip');
@@ -1035,7 +2459,7 @@ function createClipElement(clip, trackId) {
     header.className = 'clip-header';
     var label = pattern ? pattern.name : 'Pattern ' + (clip.patternId + 1);
     if (clip.loopCount > 1) {
-        label += ' ×' + clip.loopCount;
+        label += ' \u00D7' + clip.loopCount;
     }
     header.textContent = label;
     el.appendChild(header);
@@ -1048,15 +2472,15 @@ function createClipElement(clip, trackId) {
     el.appendChild(noteViz);
 
     // Render note data to canvas
-    if (pattern && pattern.data) {
-        renderClipNotes(noteViz, pattern, clip.loopCount);
+    if (pattern && pattern.notes) {
+        renderClipNotes(noteViz, pattern, renderClip);
     }
 
     // Loop handle (top-left) - changes loop count
     var loopHandle = document.createElement('div');
     loopHandle.className = 'clip-loop-handle';
     loopHandle.title = 'Drag to change loop count';
-    loopHandle.innerHTML = '⟳';
+    loopHandle.textContent = '\u27F3';
     el.appendChild(loopHandle);
 
     // Right resize handle for loop count (drag edge)
@@ -1069,9 +2493,18 @@ function createClipElement(clip, trackId) {
     var splitHandle = document.createElement('div');
     splitHandle.className = 'clip-split-handle';
     splitHandle.title = 'Click to split clip here';
-    splitHandle.innerHTML = '✂';
+    splitHandle.textContent = '\u2702';
     splitHandle.style.display = 'none';
     el.appendChild(splitHandle);
+
+    // Expand/contract handle (side button) - only when not looped
+    if (expandInfo.show) {
+        var expandHandle = document.createElement('div');
+        expandHandle.className = 'clip-expand-handle';
+        expandHandle.title = 'Drag to expand/contract pattern length';
+        expandHandle.textContent = expandInfo.hasBuffer ? '+' : '\u2194';
+        el.appendChild(expandHandle);
+    }
 
     // Show split handle on hover at grid snap positions
     if (pattern) {
@@ -1081,8 +2514,8 @@ function createClipElement(clip, trackId) {
                 return;
             }
 
-            var rect = el.getBoundingClientRect();
-            var x = e.clientX - rect.left;
+            var pt = getScaledOffsetInElement(e, el);
+            var x = pt.x;
             var clipBeats = getClipDurationBeats(clip);
             if (clipBeats <= 0) return;
             var pixelsPerBeat = clipWidth / clipBeats;
@@ -1090,7 +2523,7 @@ function createClipElement(clip, trackId) {
             var gridPixels = gridSnap * pixelsPerBeat;
 
             // Only show if grid snap markers are far enough apart
-            if (gridPixels < 6) {
+            if (gridPixels < 2) {
                 splitHandle.style.display = 'none';
                 return;
             }
@@ -1120,92 +2553,79 @@ function createClipElement(clip, trackId) {
 }
 
 // Render note visualization on clip canvas
-function renderClipNotes(canvas, pattern, loopCount) {
+function renderClipNotes(canvas, pattern, clipOrLoopCount) {
     var ctx = canvas.getContext('2d');
     var width = canvas.width;
     var height = canvas.height;
 
     ctx.clearRect(0, 0, width, height);
 
-    if (!pattern.data || pattern.steps === 0) return;
+    if (!pattern) return;
 
+    var clip = (clipOrLoopCount && typeof clipOrLoopCount === 'object') ? clipOrLoopCount : null;
+    var loopCount = (clip && typeof clip.loopCount === 'number') ? clip.loopCount : (typeof clipOrLoopCount === 'number' ? clipOrLoopCount : 1);
     var patternLpb = pattern.lpb || state.lpb;
-    var patternBeats = pattern.steps / patternLpb;
-    var totalBeats = patternBeats * loopCount;
+    var patternBeats = getPatternBeatsValue(pattern);
+    var totalBeats = clip ? getClipDurationBeats(clip) : (patternBeats * loopCount);
+    if (totalBeats <= 0) return;
+
     var pixelsPerBeat = width / totalBeats;
+    var baseNotes = pattern && pattern.notes ? pattern.notes : [];
+    var eventSource = clip ? collectClipEventsForSegment(pattern, clip, 0, totalBeats) : baseNotes;
 
     // Find note range for scaling
     var minNote = 127, maxNote = 0;
     var notes = [];
 
-    for (var step = 0; step < pattern.steps; step++) {
-        var stepData = pattern.data[step];
-        if (!stepData || !stepData.columns) continue;
-
-        for (var nc = 0; nc < stepData.columns.length; nc++) {
-            var colData = stepData.columns[nc];
-            if (!colData || !colData.note || colData.note === '' || colData.note === NOTE_OFF) continue;
-
-            var midiNote = noteNameToMidi(colData.note);
-            if (midiNote !== null) {
-                minNote = Math.min(minNote, midiNote);
-                maxNote = Math.max(maxNote, midiNote);
-
-                // Find duration (until next note or note-off in same column)
-                var durationSteps = 1;
-                for (var s = step + 1; s < pattern.steps; s++) {
-                    var sd = pattern.data[s];
-                    if (sd && sd.columns && sd.columns[nc]) {
-                        var cd = sd.columns[nc];
-                        if (cd.note && cd.note !== '') {
-                            break;
-                        }
-                    }
-                    durationSteps++;
-                }
-
-                notes.push({
-                    step: step,
-                    note: midiNote,
-                    duration: durationSteps,
-                    noteCol: nc
-                });
-            }
-        }
+    for (var i = 0; i < eventSource.length; i++) {
+        var ev = eventSource[i];
+        if (!isNoteEvent(ev)) continue;
+        if (ev.pitch === null || ev.pitch === undefined) continue;
+        var dur = (typeof ev.duration === 'number' && ev.duration > 0) ? ev.duration : (1 / patternLpb);
+        minNote = Math.min(minNote, ev.pitch);
+        maxNote = Math.max(maxNote, ev.pitch);
+        notes.push({
+            startBeat: ev.startBeat,
+            duration: dur,
+            note: ev.pitch
+        });
     }
 
-    if (notes.length === 0) return;
+    if (notes.length > 0) {
+        // Add some padding to note range
+        var noteRange = Math.max(maxNote - minNote, 12);
+        var noteCenter = (maxNote + minNote) / 2;
+        minNote = Math.floor(noteCenter - noteRange / 2);
+        maxNote = Math.ceil(noteCenter + noteRange / 2);
 
-    // Add some padding to note range
-    var noteRange = Math.max(maxNote - minNote, 12);
-    var noteCenter = (maxNote + minNote) / 2;
-    minNote = Math.floor(noteCenter - noteRange / 2);
-    maxNote = Math.ceil(noteCenter + noteRange / 2);
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
 
-    // Draw notes for each loop
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
-
-    for (var loop = 0; loop < loopCount; loop++) {
-        var loopOffset = loop * patternBeats;
-
-        for (var i = 0; i < notes.length; i++) {
-            var n = notes[i];
-            var stepBeat = n.step / patternLpb;
-            var x = (loopOffset + stepBeat) * pixelsPerBeat;
-            var w = Math.max((n.duration / patternLpb) * pixelsPerBeat - 1, 2);
-            var y = height - ((n.note - minNote) / (maxNote - minNote)) * (height - 4) - 2;
+        for (var n = 0; n < notes.length; n++) {
+            var note = notes[n];
+            var x = note.startBeat * pixelsPerBeat;
+            var w = Math.max((note.duration) * pixelsPerBeat - 1, 2);
+            var y = height - ((note.note - minNote) / (maxNote - minNote)) * (height - 4) - 2;
             var h = Math.max(2, (height - 4) / noteRange);
 
             ctx.fillRect(x, y, w, h);
         }
+    }
 
-        // Draw loop separator line
-        if (loop > 0) {
-            ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
-            ctx.beginPath();
-            ctx.moveTo(loopOffset * pixelsPerBeat, 0);
-            ctx.lineTo(loopOffset * pixelsPerBeat, height);
-            ctx.stroke();
+    if (clip) {
+        var loopLength = getClipLoopLength(clip, pattern);
+        var loopMarker = patternBeats > 0 ? patternBeats : loopLength;
+        if (loopMarker > 0 && totalBeats > loopMarker + 0.0001) {
+            ctx.save();
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.55)';
+            ctx.lineWidth = 1;
+            for (var b = loopMarker; b < totalBeats - 0.0001; b += loopMarker) {
+                var lx = Math.round(b * pixelsPerBeat) + 0.5;
+                ctx.beginPath();
+                ctx.moveTo(lx, 0);
+                ctx.lineTo(lx, height);
+                ctx.stroke();
+            }
+            ctx.restore();
         }
     }
 }
@@ -1215,7 +2635,7 @@ function noteNameToMidi(noteName) {
     if (!noteName || noteName === '' || noteName === NOTE_OFF) return null;
 
     var noteMap = { 'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11 };
-    var match = noteName.match(/^([A-G])([#b]?)(\d+)$/i);
+    var match = noteName.match(/^([A-G])([#b]?)-?(\d+)$/i);
     if (!match) return null;
 
     var note = noteMap[match[1].toUpperCase()];
@@ -1240,11 +2660,12 @@ function zoomTimeline(factor, mouseX) {
     // Adjust scroll position to zoom towards mouse position
     if (mouseX !== undefined) {
         var rect = timelineTracks.getBoundingClientRect();
+        var scale = getUiScale();
         var scrollX = timelineTracks.scrollLeft;
-        var relativeX = mouseX - rect.left + scrollX;
+        var relativeX = (mouseX - rect.left) / scale + scrollX;
         var beatAtMouse = relativeX / oldZoom;
         var newX = beatAtMouse * timelinePixelsPerBeat;
-        timelineTracks.scrollLeft = newX - (mouseX - rect.left);
+        timelineTracks.scrollLeft = newX - ((mouseX - rect.left) / scale);
     }
 
     renderTimeline();
@@ -1298,6 +2719,12 @@ function renderTimelineRuler() {
 
     var maxMarkers = Math.ceil(viewWidth / 15) + 20;
     var markerCount = 0;
+    var barPixels = beatsPerBar * timelinePixelsPerBeat;
+    var minBarLabelPx = 60;
+    var barLabelStep = 1;
+    if (barPixels > 0) {
+        barLabelStep = Math.max(1, Math.ceil(minBarLabelPx / barPixels));
+    }
 
     for (var idx = startIdx; idx <= endIdx && markerCount < maxMarkers; idx++) {
         var beatPos = idx / stepMul;
@@ -1315,6 +2742,9 @@ function renderTimelineRuler() {
 
         if (isBar) {
             var bar = Math.floor(idx / beatsPerBarMul) + 1;
+            if (((bar - 1) % barLabelStep) !== 0) {
+                continue;
+            }
             marker.className = 'bar-marker';
             marker.textContent = bar;
             ruler.appendChild(marker);
@@ -1386,11 +2816,7 @@ function updateTimelineScrollbar() {
     if (!positionDisplay || !timelineTracks) return;
 
     var currentBeat = timelineTracks.scrollLeft / timelinePixelsPerBeat;
-    var totalBeats = state.timeline.totalBeats;
-    var arrangementEnd = getMaxClipEndBeat();
-    if (arrangementEnd > 0) {
-        totalBeats = snapToMeasureEnd(arrangementEnd);
-    }
+    var totalBeats = state.timeline.loopEnabled ? state.timeline.loopEnd : state.timeline.totalBeats;
 
     // Convert beats to time (MM:SS) based on BPM
     var currentTime = (currentBeat / state.bpm) * 60;
@@ -1411,10 +2837,25 @@ function updateTimelineScrollbar() {
 }
 
 function handleTimelineClick(e) {
+    uiFocus = 'timeline';
+    if (clipDragState.suppressClick) {
+        clipDragState.suppressClick = false;
+        return;
+    }
+    if (timelineSelection.suppressClick) {
+        timelineSelection.suppressClick = false;
+        return;
+    }
     var target = e.target;
 
     // Hide context menu on click
     hideTimelineContextMenu();
+
+    // Click on expand/contract handle (no-op; drag handles length)
+    if (target.classList.contains('clip-expand-handle')) {
+        e.stopPropagation();
+        return;
+    }
 
     // Click on split handle
     if (target.classList.contains('clip-split-handle')) {
@@ -1437,6 +2878,7 @@ function handleTimelineClick(e) {
         !target.classList.contains('clip-resize-handle')) {
         var clipId = parseFloat(clipEl.getAttribute('data-clip-id'));
         var trackId = parseInt(clipEl.getAttribute('data-track-id'));
+        updateTimelineCursorFromEvent(e, trackId);
         selectClip(trackId, clipId);
         return;
     }
@@ -1450,24 +2892,17 @@ function handleTimelineClick(e) {
         renderTrackList();
 
         // Set playback position from click
-        setPlayheadFromClick(e);
+        setPlayheadFromClick(e, trackId);
     }
 }
 
 // Set the playhead position from a click event on the timeline
-function setPlayheadFromClick(e) {
+function setPlayheadFromClick(e, trackId) {
     var container = document.getElementById('timeline-tracks');
     if (!container) return;
 
-    var rect = container.getBoundingClientRect();
-    var clickX = e.clientX - rect.left + container.scrollLeft;
-    var beat = clickX / timelinePixelsPerBeat;
-
-    // Snap to grid
-    var snapBeats = state.timeline.gridSnap || 1;
-    beat = Math.round(beat / snapBeats) * snapBeats;
-
-    beat = Math.max(0, beat);
+    var beat = getTimelineBeatFromClientX(e.clientX, container);
+    updateTimelineCursor(beat, trackId);
     state.currentBeat = beat;
 
     // Show and position the playhead
@@ -1479,6 +2914,34 @@ function setPlayheadFromClick(e) {
 
     // Update position display
     updateTimelinePlayhead();
+}
+
+function getTimelineBeatFromClientX(clientX, container) {
+    if (!container) return 0;
+    var rect = container.getBoundingClientRect();
+    var scale = getUiScale();
+    var clickX = (clientX - rect.left) / scale + container.scrollLeft;
+    var beat = clickX / timelinePixelsPerBeat;
+
+    var snapBeats = state.timeline.gridSnap || 1;
+    beat = Math.round(beat / snapBeats) * snapBeats;
+    return Math.max(0, beat);
+}
+
+function updateTimelineCursor(beat, trackId) {
+    if (typeof beat === 'number' && !isNaN(beat)) {
+        state.timeline.cursorBeat = beat;
+    }
+    if (typeof trackId === 'number' && !isNaN(trackId)) {
+        state.timeline.cursorTrack = trackId;
+    }
+}
+
+function updateTimelineCursorFromEvent(e, trackId) {
+    var container = document.getElementById('timeline-tracks');
+    if (!container) return;
+    var beat = getTimelineBeatFromClientX(e.clientX, container);
+    updateTimelineCursor(beat, trackId);
 }
 
 // Split a clip at a specific beat
@@ -1501,39 +2964,67 @@ function splitClipAtBeat(trackId, clipId, splitBeat) {
     var pattern = state.patterns[clip.patternId];
     if (!pattern) return;
 
-    var patternLpb = pattern.lpb || state.lpb;
-    var patternBeats = pattern.steps / patternLpb;
-
     // Calculate split position within clip
     var localBeat = splitBeat - clip.startBeat;
     var clipDuration = getClipDurationBeats(clip);
-    if (localBeat <= 0.001 || localBeat >= clipDuration - 0.001) return;
+    if (clipDuration <= 0) return;
 
-    // Calculate where in the looped pattern the split falls
-    var beatInPattern = ((clip.offset || 0) + localBeat) % patternBeats;
-    var totalBeatFromStart = (clip.offset || 0) + localBeat;
+    // Quantize split for tracker patterns to step grid
+    if (pattern.type !== 'piano') {
+        var lpb = pattern.lpb || state.lpb;
+        localBeat = quantizeBeatToLpb(localBeat, lpb);
+        clipDuration = quantizeBeatToLpb(clipDuration, lpb);
+    }
 
-    // New clip: starts at splitBeat, offset into pattern, remaining duration
-    var newOffset = totalBeatFromStart % patternBeats;
-    var remainingDuration = clipDuration - localBeat;
-    var newLoopCount = (remainingDuration + newOffset) / patternBeats;
+    if (localBeat <= 0.0001 || localBeat >= clipDuration - 0.0001) return;
 
+    var patternBeats = getPatternBeatsValue(pattern);
+    var loopLength = getClipLoopLength(clip, pattern);
+    if (loopLength <= 0) return;
+
+    var leftDuration = localBeat;
+    var rightDuration = clipDuration - localBeat;
+    if (leftDuration <= 0 || rightDuration <= 0) return;
+
+    var rightOffset = (clip.offset || 0) + (localBeat % loopLength);
+    if (patternBeats > 0) {
+        rightOffset = ((rightOffset % patternBeats) + patternBeats) % patternBeats;
+    }
+
+    // Keep the original loop window and only split playback duration.
+    // This preserves the full pattern data instead of turning each side into a new mini-loop.
+    var leftLoopCount = leftDuration / loopLength;
+    var rightLoopCount = rightDuration / loopLength;
+    if (leftLoopCount <= 0 || rightLoopCount <= 0) return;
+    leftLoopCount = parseFloat(leftLoopCount.toFixed(8));
+    rightLoopCount = parseFloat(rightLoopCount.toFixed(8));
+
+    // Update original clip to left segment
+    clip.isExpanded = false;
+    clip.trimOffset = undefined;
+    clip.trimLoopLength = undefined;
+    clip.trimLoopCount = undefined;
+    clip.loopLength = loopLength;
+    clip.loopCount = leftLoopCount;
+
+    // Create new clip for right segment
     var newClip = {
         id: Date.now() + Math.random(),
         patternId: clip.patternId,
-        startBeat: splitBeat,
-        loopCount: newLoopCount,
-        offset: newOffset
+        startBeat: clip.startBeat + localBeat,
+        loopCount: rightLoopCount,
+        offset: rightOffset,
+        loopLength: loopLength,
+        isExpanded: false
     };
-
-    // Shrink original clip to end at split point
-    var originalDuration = localBeat;
-    clip.loopCount = (originalDuration + (clip.offset || 0)) / patternBeats;
 
     track.clips.push(newClip);
 
     renderTimeline();
-    consoleLog('Split clip at beat ' + splitBeat.toFixed(2));
+    if (state.selectedClip && state.selectedClip.clipId === clip.id && state.selectedClip.trackId === trackId) {
+        setPrimaryClip(trackId, clip.id);
+    }
+    consoleLog('Split clip at beat ' + (clip.startBeat + localBeat).toFixed(2));
 }
 
 // Timeline right-click context menu
@@ -1545,6 +3036,7 @@ var timelineContextState = {
 
 function handleTimelineContextMenu(e) {
     e.preventDefault();
+    uiFocus = 'timeline';
 
     var target = e.target;
     var menu = document.getElementById('timeline-context-menu');
@@ -1554,23 +3046,53 @@ function handleTimelineContextMenu(e) {
     var row = target.closest('.timeline-track-row');
     if (row) {
         timelineContextState.trackId = parseInt(row.getAttribute('data-track-id'));
-        var rect = row.getBoundingClientRect();
-        timelineContextState.beat = Math.floor((e.clientX - rect.left) / timelinePixelsPerBeat);
+        var container = document.getElementById('timeline-tracks');
+        timelineContextState.beat = getTimelineBeatFromClientX(e.clientX, container);
+        updateTimelineCursor(timelineContextState.beat, timelineContextState.trackId);
+    } else {
+        var container = document.getElementById('timeline-tracks');
+        if (container) {
+            timelineContextState.trackId = state.selectedTrack >= 0 ? state.selectedTrack : 0;
+            timelineContextState.beat = getTimelineBeatFromClientX(e.clientX, container);
+            updateTimelineCursor(timelineContextState.beat, timelineContextState.trackId);
+        }
     }
 
-    // Check if clicking on a clip
-    if (target.classList.contains('timeline-clip')) {
-        timelineContextState.clipId = parseFloat(target.getAttribute('data-clip-id'));
+    // Check if clicking on a clip (or any of its children like header/canvas/handles)
+    var clipEl = target.closest('.timeline-clip');
+    if (clipEl) {
+        var clipId = parseFloat(clipEl.getAttribute('data-clip-id'));
+        var clipTrackId = parseInt(clipEl.getAttribute('data-track-id'));
+        timelineContextState.clipId = clipId;
+        if (!isClipSelected(clipTrackId, clipId)) {
+            selectClip(clipTrackId, clipId);
+        }
         menu.querySelector('[data-action="delete-clip"]').style.display = 'block';
+        var uniqueItem = menu.querySelector('[data-action="make-unique"]');
+        var convertItem = menu.querySelector('[data-action="convert-pattern"]');
+        if (uniqueItem) uniqueItem.style.display = 'block';
+        if (convertItem) {
+            convertItem.style.display = 'block';
+            var clip = findClipById(clipTrackId, clipId);
+            var pattern = clip ? state.patterns[clip.patternId] : null;
+            if (pattern && pattern.type === 'piano') {
+                convertItem.textContent = 'Convert to Tracker';
+            } else {
+                convertItem.textContent = 'Convert to Piano Roll';
+            }
+        }
     } else {
         timelineContextState.clipId = null;
         menu.querySelector('[data-action="delete-clip"]').style.display = 'none';
+        var uniqueItem = menu.querySelector('[data-action="make-unique"]');
+        var convertItem = menu.querySelector('[data-action="convert-pattern"]');
+        if (uniqueItem) uniqueItem.style.display = 'none';
+        if (convertItem) convertItem.style.display = 'none';
     }
 
     // Position and show menu
-    menu.style.left = e.clientX + 'px';
-    menu.style.top = e.clientY + 'px';
     menu.style.display = 'block';
+    positionMenuAtClient(menu, e.clientX, e.clientY);
 }
 
 function hideTimelineContextMenu() {
@@ -1587,24 +3109,35 @@ function handleTimelineContextAction(action) {
             break;
         case 'copy-clip':
             if (timelineContextState.clipId !== null) {
-                state.selectedClip = { trackId: timelineContextState.trackId, clipId: timelineContextState.clipId };
+                selectClip(timelineContextState.trackId, timelineContextState.clipId);
                 copyClip();
             }
             break;
         case 'cut-clip':
             if (timelineContextState.clipId !== null) {
-                state.selectedClip = { trackId: timelineContextState.trackId, clipId: timelineContextState.clipId };
+                selectClip(timelineContextState.trackId, timelineContextState.clipId);
                 cutClip();
             }
             break;
         case 'paste-clip':
-            pasteClip(timelineContextState.trackId, timelineContextState.beat);
+            pasteClips(timelineContextState.trackId, timelineContextState.beat);
             break;
         case 'delete-clip':
             if (timelineContextState.clipId !== null) {
                 removeClipFromTrack(timelineContextState.trackId, timelineContextState.clipId);
+                cleanupUnusedPatterns();
                 renderTimeline();
                 consoleLog('Deleted clip');
+            }
+            break;
+        case 'make-unique':
+            if (timelineContextState.clipId !== null) {
+                makeSelectedClipsUnique();
+            }
+            break;
+        case 'convert-pattern':
+            if (timelineContextState.clipId !== null) {
+                convertSelectedClipPattern();
             }
             break;
         case 'add-piano-roll':
@@ -1633,9 +3166,8 @@ function handleCodeEditorContextMenu(e) {
     codeEditorContextState.selectionStart = e.target.selectionStart;
     codeEditorContextState.selectionEnd = e.target.selectionEnd;
 
-    menu.style.left = e.clientX + 'px';
-    menu.style.top = e.clientY + 'px';
     menu.style.display = 'block';
+    positionMenuAtClient(menu, e.clientX, e.clientY);
 
     // Hide on click elsewhere
     setTimeout(function() {
@@ -1651,16 +3183,30 @@ function hideCodeEditorContextMenu() {
 function handleCodeEditorContextAction(action) {
     hideCodeEditorContextMenu();
 
-    if (action === 'insert-sampler') {
-        insertSamplerCode();
+    switch (action) {
+        case 'insert-sampler':
+            insertCodeTemplate('sampler');
+            break;
+        case 'insert-oscillator':
+            insertCodeTemplate('oscillator');
+            break;
+        case 'insert-envelope':
+            insertCodeTemplate('envelope');
+            break;
+        case 'insert-filter':
+            insertCodeTemplate('filter');
+            break;
+        case 'insert-reverb':
+            insertCodeTemplate('reverb');
+            break;
+        case 'insert-pfield-comment':
+            insertCodeTemplate('pfield');
+            break;
     }
 }
 
-function insertSamplerCode() {
-    var textarea = codeEditorContextState.textarea || document.getElementById('code-editor');
-    if (!textarea) return;
-
-    var samplerCode = `    iSample = 100
+var codeTemplates = {
+    sampler: `    iSample = 100
     iLen    = ftlen(iSample)
 
     ; parameters
@@ -1686,19 +3232,91 @@ function insertSamplerCode() {
     ; table read
     aSig tab aPos, iSample
 
-    outs aSig, aSig`;
+    outs aSig, aSig`,
+
+    oscillator: `    ; Oscillator with multiple waveforms
+    iFreq = p4
+    iAmp  = p5
+
+    ; Choose waveform: 0=sine, 1=saw, 2=square, 3=triangle
+    iWave = 0
+
+    if (iWave == 0) then
+        aOsc poscil iAmp, iFreq
+    elseif (iWave == 1) then
+        aOsc vco2 iAmp, iFreq, 0      ; sawtooth
+    elseif (iWave == 2) then
+        aOsc vco2 iAmp, iFreq, 10     ; square
+    else
+        aOsc vco2 iAmp, iFreq, 12     ; triangle
+    endif
+
+    outs aOsc, aOsc`,
+
+    envelope: `    ; ADSR Envelope
+    iAtt  = 0.01    ; attack time
+    iDec  = 0.1     ; decay time
+    iSus  = 0.7     ; sustain level (0-1)
+    iRel  = 0.3     ; release time
+
+    ; Create envelope
+    aEnv madsr iAtt, iDec, iSus, iRel
+
+    ; Apply to signal
+    aOut = aSig * aEnv`,
+
+    filter: `    ; Lowpass Filter with resonance
+    iCutoff = 2000   ; cutoff frequency in Hz
+    iRes    = 0.5    ; resonance (0-1)
+
+    ; Moog-style lowpass filter
+    aFilt moogladder aSig, iCutoff, iRes
+
+    ; Alternative: Butterworth lowpass
+    ; aFilt butterlp aSig, iCutoff`,
+
+    reverb: `    ; Stereo Reverb
+    iRoomSize = 0.8     ; room size (0-1)
+    iDamp     = 0.5     ; high frequency damping (0-1)
+    iMix      = 0.3     ; wet/dry mix (0-1)
+
+    ; Freeverb algorithm
+    aRevL, aRevR freeverb aSig, aSig, iRoomSize, iDamp
+
+    ; Mix dry and wet
+    aOutL = aSig * (1 - iMix) + aRevL * iMix
+    aOutR = aSig * (1 - iMix) + aRevR * iMix
+
+    outs aOutL, aOutR`,
+
+    pfield: `    ; P-field reference:
+    ; p1 = instrument number (fractional for polyphony)
+    ; p2 = start time
+    ; p3 = duration (-1 for held notes)
+    ; p4 = frequency (Hz)
+    ; p5 = amplitude (0-1)
+    ; p6 = fx1 value
+    ; p7 = fx2 value
+    ; ...etc`
+};
+
+function insertCodeTemplate(templateName) {
+    var textarea = codeEditorContextState.textarea || document.getElementById('code-editor');
+    if (!textarea) return;
+
+    var code = codeTemplates[templateName];
+    if (!code) return;
 
     var pos = codeEditorContextState.selectionStart;
     var before = textarea.value.substring(0, pos);
     var after = textarea.value.substring(codeEditorContextState.selectionEnd);
 
-    textarea.value = before + samplerCode + after;
-    textarea.selectionStart = textarea.selectionEnd = pos + samplerCode.length;
+    textarea.value = before + code + after;
+    textarea.selectionStart = textarea.selectionEnd = pos + code.length;
     textarea.focus();
 
-    // Save the instrument
     saveCurrentInstrument();
-    consoleLog('Inserted sampler code');
+    consoleLog('Inserted ' + templateName + ' template');
 }
 
 function addPatternToTrack(trackId, beat) {
@@ -1739,60 +3357,16 @@ function addPianoRollToTrack(trackId, beat) {
     }
 }
 
-function selectClip(trackId, clipId) {
-    // Deselect all clips
-    document.querySelectorAll('.timeline-clip.selected').forEach(function(el) {
-        el.classList.remove('selected');
-    });
+function selectClip(trackId, clipId, options) {
+    options = options || {};
+    var keepExisting = !!options.keepExisting;
 
-    // Select this clip
-    var clipEl = document.querySelector('.timeline-clip[data-clip-id="' + clipId + '"]');
-    if (clipEl) {
-        clipEl.classList.add('selected');
+    var clips = keepExisting ? selectedClips.slice() : [];
+    if (!isClipSelected(trackId, clipId)) {
+        clips.push({ trackId: trackId, clipId: clipId });
     }
 
-    // Update selected clip state (DAW-style - this is how we edit patterns)
-    state.selectedClip = { trackId: trackId, clipId: clipId };
-    state.selectedTrack = trackId;
-    state.focusedTrack = trackId;
-
-    // Find the clip and its pattern
-    var track = state.tracks[trackId];
-    var clip = null;
-    for (var i = 0; i < track.clips.length; i++) {
-        if (track.clips[i].id === clipId) {
-            clip = track.clips[i];
-            break;
-        }
-    }
-
-    if (clip) {
-        var pattern = state.patterns[clip.patternId];
-        if (pattern) {
-            // Update pattern title display
-            updatePatternPianoTitle(trackId, pattern);
-            switchEditorView('pattern');
-
-            // Show appropriate editor based on pattern type
-            var trackerContainer = document.getElementById('tracker-container');
-            var pianoContainer = document.getElementById('piano-roll-container');
-
-            if (pattern.type === 'piano') {
-                // Show piano roll, hide tracker
-                if (trackerContainer) trackerContainer.classList.add('hidden');
-                if (pianoContainer) pianoContainer.classList.remove('hidden');
-                updatePianoInstrumentSelector();
-                renderPianoRoll();
-            } else {
-                // Show tracker, hide piano roll
-                if (trackerContainer) trackerContainer.classList.remove('hidden');
-                if (pianoContainer) pianoContainer.classList.add('hidden');
-                renderTrackerGrid(true);
-            }
-        }
-    }
-
-    renderTrackList();
+    applyClipSelection(clips, { trackId: trackId, clipId: clipId });
 }
 
 function updatePatternPianoTitle(trackId, pattern) {
@@ -1826,8 +3400,7 @@ function updateTimelinePlayhead() {
     var positionDisplay = document.getElementById('timeline-position-display');
     if (positionDisplay && state.isPlaying) {
         var currentBeat = state.currentBeat;
-        var totalBeats = state.timeline.loopEnabled ? state.timeline.loopEnd : getMaxClipEndBeat();
-        if (totalBeats <= 0) totalBeats = state.timeline.totalBeats;
+        var totalBeats = state.timeline.loopEnabled ? state.timeline.loopEnd : state.timeline.totalBeats;
 
         // Convert beats to time (MM:SS) based on BPM
         var currentTime = (currentBeat / state.bpm) * 60;
@@ -1854,25 +3427,120 @@ function updateTimelinePlayhead() {
 
 var clipDragState = {
     active: false,
-    mode: null,       // 'move', 'resize', or 'end-marker'
+    mode: null,       // 'move', 'resize', 'expand-handle', or 'end-marker'
     clipId: null,
     trackId: null,
+    currentTrackId: null,
     startX: 0,
     startBeat: 0,
     startLoopCount: 1,
     clipElement: null,
-    startTotalBeats: 0
+    startTotalBeats: 0,
+    startPatternBeats: 0,
+    lastPatternBeats: 0,
+    suppressClick: false,
+    didDrag: false
 };
 
+var timelineSelection = {
+    active: false,
+    startX: 0,
+    startY: 0,
+    endX: 0,
+    endY: 0,
+    didDrag: false,
+    suppressClick: false,
+    boxEl: null
+};
+
+function getTimelineTrackIdAt(clientY) {
+    var container = document.getElementById('timeline-tracks');
+    if (!container) return null;
+    var rect = container.getBoundingClientRect();
+    var scale = getUiScale();
+    var y = (clientY - rect.top) / scale + container.scrollTop;
+    var row = container.querySelector('.timeline-track-row');
+    var rowHeight = row ? row.offsetHeight : 60;
+    if (rowHeight <= 0) rowHeight = 60;
+    var rowIndex = Math.floor(y / rowHeight);
+    var trackId = state.visibleTrackStart + rowIndex;
+    if (trackId < 0 || trackId >= state.tracks.length) return null;
+    return trackId;
+}
+
+function moveClipToTrack(clipId, fromTrackId, toTrackId) {
+    if (fromTrackId === toTrackId) return null;
+    var fromTrack = state.tracks[fromTrackId];
+    var toTrack = state.tracks[toTrackId];
+    if (!fromTrack || !toTrack) return null;
+
+    var clipIndex = -1;
+    for (var i = 0; i < fromTrack.clips.length; i++) {
+        if (fromTrack.clips[i].id === clipId) {
+            clipIndex = i;
+            break;
+        }
+    }
+    if (clipIndex < 0) return null;
+
+    var clip = fromTrack.clips.splice(clipIndex, 1)[0];
+    toTrack.clips.push(clip);
+
+    for (var j = 0; j < selectedClips.length; j++) {
+        if (selectedClips[j].clipId === clipId && selectedClips[j].trackId === fromTrackId) {
+            selectedClips[j].trackId = toTrackId;
+        }
+    }
+
+    if (state.selectedClip && state.selectedClip.clipId === clipId && state.selectedClip.trackId === fromTrackId) {
+        state.selectedClip.trackId = toTrackId;
+        state.selectedTrack = toTrackId;
+        state.focusedTrack = toTrackId;
+    }
+
+    return clip;
+}
+
 function handleTimelineMouseDown(e) {
+    uiFocus = 'timeline';
     var target = e.target;
+
+    if (target.classList.contains('clip-expand-handle')) {
+        e.preventDefault();
+        var clipEl = target.closest('.timeline-clip');
+        if (!clipEl) return;
+        var clipId = parseFloat(clipEl.getAttribute('data-clip-id'));
+        var trackId = parseInt(clipEl.getAttribute('data-track-id'));
+        var clip = findClipById(trackId, clipId);
+        if (!clip) return;
+        var pattern = state.patterns[clip.patternId];
+        if (!pattern) return;
+
+        var info = getClipExpandInfo(clip, pattern);
+        if (!info.show) return;
+
+        selectClip(trackId, clipId);
+
+        clipDragState.active = true;
+        clipDragState.mode = 'expand-handle';
+        clipDragState.clipId = clipId;
+        clipDragState.trackId = trackId;
+        clipDragState.currentTrackId = trackId;
+        clipDragState.startX = getScaledClientX(e);
+        clipDragState.startPatternBeats = info.patternBeats;
+        clipDragState.lastPatternBeats = info.patternBeats;
+        clipDragState.clipElement = clipEl;
+        clipDragState.didDrag = false;
+        document.body.style.cursor = 'ew-resize';
+        return;
+    }
 
     // Check if clicking on song end marker
     if (target.classList.contains('timeline-end-marker')) {
         e.preventDefault();
         clipDragState.active = true;
         clipDragState.mode = 'end-marker';
-        clipDragState.startX = e.clientX;
+        clipDragState.startX = getScaledClientX(e);
         clipDragState.startTotalBeats = state.timeline.totalBeats;
         clipDragState.clipElement = target;
         document.body.style.cursor = 'ew-resize';
@@ -1884,7 +3552,7 @@ function handleTimelineMouseDown(e) {
         e.preventDefault();
         clipDragState.active = true;
         clipDragState.mode = 'loop-start';
-        clipDragState.startX = e.clientX;
+        clipDragState.startX = getScaledClientX(e);
         clipDragState.startBeat = state.timeline.loopStart;
         clipDragState.clipElement = target;
         document.body.style.cursor = 'ew-resize';
@@ -1896,7 +3564,7 @@ function handleTimelineMouseDown(e) {
         e.preventDefault();
         clipDragState.active = true;
         clipDragState.mode = 'loop-end';
-        clipDragState.startX = e.clientX;
+        clipDragState.startX = getScaledClientX(e);
         clipDragState.startBeat = state.timeline.loopEnd;
         clipDragState.clipElement = target;
         document.body.style.cursor = 'ew-resize';
@@ -1920,11 +3588,16 @@ function handleTimelineMouseDown(e) {
         }
 
         if (clip) {
+            clip.isExpanded = false;
+            clip.trimOffset = undefined;
+            clip.trimLoopLength = undefined;
+            clip.trimLoopCount = undefined;
             clipDragState.active = true;
             clipDragState.mode = 'resize';
             clipDragState.clipId = clipId;
             clipDragState.trackId = trackId;
-            clipDragState.startX = e.clientX;
+            clipDragState.currentTrackId = trackId;
+            clipDragState.startX = getScaledClientX(e);
             clipDragState.startLoopCount = clip.loopCount;
             clipDragState.clipElement = clipEl;
             document.body.style.cursor = 'ew-resize';
@@ -1949,15 +3622,28 @@ function handleTimelineMouseDown(e) {
         }
 
         if (clip) {
+            clip.isExpanded = false;
+            clip.trimOffset = undefined;
+            clip.trimLoopLength = undefined;
+            clip.trimLoopCount = undefined;
             clipDragState.active = true;
             clipDragState.mode = 'loop-handle';
             clipDragState.clipId = clipId;
             clipDragState.trackId = trackId;
-            clipDragState.startX = e.clientX;
+            clipDragState.currentTrackId = trackId;
+            clipDragState.startX = getScaledClientX(e);
             clipDragState.startLoopCount = clip.loopCount;
             clipDragState.clipElement = clipEl;
             document.body.style.cursor = 'ew-resize';
         }
+        return;
+    }
+
+    // Start multi-clip selection drag on empty track area
+    var row = target.closest('.timeline-track-row');
+    var clipEl = target.closest('.timeline-clip');
+    if (row && !clipEl && e.button === 0) {
+        startTimelineSelection(e);
         return;
     }
 
@@ -1984,7 +3670,8 @@ function handleTimelineMouseDown(e) {
             clipDragState.mode = 'move';
             clipDragState.clipId = clipId;
             clipDragState.trackId = trackId;
-            clipDragState.startX = e.clientX;
+            clipDragState.currentTrackId = trackId;
+            clipDragState.startX = getScaledClientX(e);
             clipDragState.startBeat = clip.startBeat;
             clipDragState.clipElement = clipEl;
             document.body.style.cursor = 'grabbing';
@@ -1995,41 +3682,268 @@ function handleTimelineMouseDown(e) {
     }
 }
 
-// Copy selected clip to clipboard
-function copyClip() {
-    if (!state.selectedClip || state.selectedClip.clipId === null) {
-        consoleLog('No clip selected to copy');
-        return;
+function startTimelineSelection(e) {
+    var container = document.getElementById('timeline-tracks');
+    if (!container) return;
+    var content = container.querySelector('.timeline-content');
+    if (!content) return;
+
+    e.preventDefault();
+    var rect = container.getBoundingClientRect();
+    var scale = getUiScale();
+    var x = (e.clientX - rect.left) / scale + container.scrollLeft;
+    var y = (e.clientY - rect.top) / scale + container.scrollTop;
+
+    timelineSelection.active = true;
+    timelineSelection.didDrag = false;
+    timelineSelection.startX = x;
+    timelineSelection.startY = y;
+    timelineSelection.endX = x;
+    timelineSelection.endY = y;
+
+    if (!timelineSelection.boxEl) {
+        timelineSelection.boxEl = document.createElement('div');
+        timelineSelection.boxEl.className = 'timeline-selection-box';
     }
 
-    var track = state.tracks[state.selectedClip.trackId];
-    if (!track) return;
+    timelineSelection.boxEl.style.left = x + 'px';
+    timelineSelection.boxEl.style.top = y + 'px';
+    timelineSelection.boxEl.style.width = '0px';
+    timelineSelection.boxEl.style.height = '0px';
+    if (!content.contains(timelineSelection.boxEl)) {
+        content.appendChild(timelineSelection.boxEl);
+    }
 
-    for (var i = 0; i < track.clips.length; i++) {
-        if (track.clips[i].id === state.selectedClip.clipId) {
-            clipboardClip = JSON.parse(JSON.stringify(track.clips[i]));
-            clipboardClip.sourceTrackId = state.selectedClip.trackId;
-            consoleLog('Copied clip');
-            return;
+    document.addEventListener('mousemove', onTimelineSelectionMouseMove);
+    document.addEventListener('mouseup', onTimelineSelectionMouseUp);
+}
+
+function onTimelineSelectionMouseMove(e) {
+    if (!timelineSelection.active) return;
+    var container = document.getElementById('timeline-tracks');
+    if (!container) return;
+
+    var rect = container.getBoundingClientRect();
+    var scale = getUiScale();
+    var x = (e.clientX - rect.left) / scale + container.scrollLeft;
+    var y = (e.clientY - rect.top) / scale + container.scrollTop;
+
+    timelineSelection.endX = x;
+    timelineSelection.endY = y;
+
+    var minX = Math.min(timelineSelection.startX, timelineSelection.endX);
+    var maxX = Math.max(timelineSelection.startX, timelineSelection.endX);
+    var minY = Math.min(timelineSelection.startY, timelineSelection.endY);
+    var maxY = Math.max(timelineSelection.startY, timelineSelection.endY);
+
+    var moved = Math.abs(maxX - minX) > 3 || Math.abs(maxY - minY) > 3;
+    if (moved) timelineSelection.didDrag = true;
+
+    if (timelineSelection.boxEl) {
+        timelineSelection.boxEl.style.left = minX + 'px';
+        timelineSelection.boxEl.style.top = minY + 'px';
+        timelineSelection.boxEl.style.width = (maxX - minX) + 'px';
+        timelineSelection.boxEl.style.height = (maxY - minY) + 'px';
+    }
+
+    if (!timelineSelection.didDrag) return;
+
+    var selected = [];
+    var clipEls = document.querySelectorAll('.timeline-clip');
+    var containerRect = container.getBoundingClientRect();
+
+    for (var i = 0; i < clipEls.length; i++) {
+        var clipEl = clipEls[i];
+        var clipRect = clipEl.getBoundingClientRect();
+        var left = (clipRect.left - containerRect.left) / scale + container.scrollLeft;
+        var right = left + clipRect.width / scale;
+        var top = (clipRect.top - containerRect.top) / scale + container.scrollTop;
+        var bottom = top + clipRect.height / scale;
+
+        var intersects = left < maxX && right > minX && top < maxY && bottom > minY;
+        if (intersects) {
+            selected.push({
+                trackId: parseInt(clipEl.getAttribute('data-track-id')),
+                clipId: parseFloat(clipEl.getAttribute('data-clip-id'))
+            });
         }
+    }
+
+    updateClipSelectionVisuals(selected);
+}
+
+function onTimelineSelectionMouseUp(e) {
+    if (!timelineSelection.active) return;
+
+    timelineSelection.active = false;
+    document.removeEventListener('mousemove', onTimelineSelectionMouseMove);
+    document.removeEventListener('mouseup', onTimelineSelectionMouseUp);
+
+    if (timelineSelection.boxEl && timelineSelection.boxEl.parentNode) {
+        timelineSelection.boxEl.parentNode.removeChild(timelineSelection.boxEl);
+    }
+
+    if (timelineSelection.didDrag) {
+        var selected = [];
+        var clipEls = document.querySelectorAll('.timeline-clip.selected');
+        for (var i = 0; i < clipEls.length; i++) {
+            selected.push({
+                trackId: parseInt(clipEls[i].getAttribute('data-track-id')),
+                clipId: parseFloat(clipEls[i].getAttribute('data-clip-id'))
+            });
+        }
+
+        var primary = null;
+        if (state.selectedClip && state.selectedClip.clipId !== null) {
+            for (var j = 0; j < selected.length; j++) {
+                if (selected[j].trackId === state.selectedClip.trackId && selected[j].clipId === state.selectedClip.clipId) {
+                    primary = selected[j];
+                    break;
+                }
+            }
+        }
+        if (!primary && selected.length > 0) primary = selected[0];
+
+        applyClipSelection(selected, primary);
+        timelineSelection.suppressClick = true;
     }
 }
 
-// Cut selected clip (copy and delete)
+function collectSelectedClips() {
+    if (selectedClips.length > 0) return selectedClips.slice();
+    if (state.selectedClip && state.selectedClip.clipId !== null) {
+        return [{ trackId: state.selectedClip.trackId, clipId: state.selectedClip.clipId }];
+    }
+    return [];
+}
+
+function copySelectedClips() {
+    var list = collectSelectedClips();
+    if (list.length === 0) {
+        consoleLog('No clip selected to copy');
+        return false;
+    }
+
+    var clipData = [];
+    var minBeat = Infinity;
+    var minTrack = Infinity;
+
+    for (var i = 0; i < list.length; i++) {
+        var clip = findClipById(list[i].trackId, list[i].clipId);
+        if (!clip) continue;
+        clipData.push({
+            trackId: list[i].trackId,
+            patternId: clip.patternId,
+            startBeat: clip.startBeat,
+            loopCount: clip.loopCount,
+            offset: clip.offset || 0,
+            loopLength: clip.loopLength,
+            isExpanded: clip.isExpanded || false,
+            trimOffset: clip.trimOffset,
+            trimLoopLength: clip.trimLoopLength,
+            trimLoopCount: clip.trimLoopCount
+        });
+        if (clip.startBeat < minBeat) minBeat = clip.startBeat;
+        if (list[i].trackId < minTrack) minTrack = list[i].trackId;
+    }
+
+    if (clipData.length === 0) {
+        consoleLog('No clip selected to copy');
+        return false;
+    }
+
+    clipboardClips = {
+        clips: clipData,
+        minBeat: minBeat,
+        minTrack: minTrack
+    };
+
+    clipboardClip = null;
+    if (clipData.length === 1) {
+        clipboardClip = JSON.parse(JSON.stringify(clipData[0]));
+        clipboardClip.sourceTrackId = clipData[0].trackId;
+    }
+
+    clipboard.type = null;
+    clipboard.data = null;
+    consoleLog('Copied ' + clipData.length + ' clip(s)');
+    return true;
+}
+
+// Copy selected clip(s) to clipboard
+function copyClip() {
+    copySelectedClips();
+}
+
+// Cut selected clip(s) (copy and delete)
 function cutClip() {
-    if (!state.selectedClip || state.selectedClip.clipId === null) {
+    var list = collectSelectedClips();
+    if (list.length === 0) {
         consoleLog('No clip selected to cut');
         return;
     }
 
-    copyClip();
-    removeClipFromTrack(state.selectedClip.trackId, state.selectedClip.clipId);
-    state.selectedClip = null;
+    pushUndo('clip-edit', captureStateForUndo('clip-edit'));
+    if (!copySelectedClips()) return;
+
+    for (var i = 0; i < list.length; i++) {
+        removeClipFromTrack(list[i].trackId, list[i].clipId);
+    }
+
+    applyClipSelection([], null);
+    cleanupUnusedPatterns();
     renderTimeline();
-    consoleLog('Cut clip');
+    consoleLog('Cut ' + list.length + ' clip(s)');
 }
 
-// Paste clip at current position
+function pasteClips(targetTrackId, targetBeat) {
+    if (clipboardClips && clipboardClips.clips && clipboardClips.clips.length > 0) {
+        var baseTrack = targetTrackId !== undefined ? targetTrackId : state.selectedTrack;
+        var baseBeat = targetBeat !== undefined ? targetBeat : (state.currentBeat || 0);
+
+        if (state.timeline.snapToMeasure) {
+            baseBeat = snapToMeasureStart(baseBeat);
+        }
+
+        var newSelections = [];
+        for (var i = 0; i < clipboardClips.clips.length; i++) {
+            var c = clipboardClips.clips[i];
+            var destTrack = baseTrack + (c.trackId - clipboardClips.minTrack);
+            if (destTrack < 0) continue;
+            while (destTrack >= state.tracks.length) {
+                addTrack();
+            }
+
+            var newClip = {
+                id: Date.now() + Math.random(),
+                patternId: c.patternId,
+                startBeat: baseBeat + (c.startBeat - clipboardClips.minBeat),
+                loopCount: c.loopCount,
+                offset: c.offset || 0,
+                loopLength: c.loopLength,
+                isExpanded: c.isExpanded || false,
+                trimOffset: c.trimOffset,
+                trimLoopLength: c.trimLoopLength,
+                trimLoopCount: c.trimLoopCount
+            };
+
+            state.tracks[destTrack].clips.push(newClip);
+            newSelections.push({ trackId: destTrack, clipId: newClip.id });
+        }
+
+        autoExtendTimeline();
+        renderTimeline();
+        if (newSelections.length > 0) {
+            applyClipSelection(newSelections, newSelections[0]);
+        }
+        consoleLog('Pasted ' + newSelections.length + ' clip(s)');
+        return;
+    }
+
+    pasteClip(targetTrackId, targetBeat);
+}
+
+// Paste single clip at current position
 function pasteClip(targetTrackId, targetBeat) {
     if (!clipboardClip) {
         consoleLog('No clip in clipboard');
@@ -2047,7 +3961,13 @@ function pasteClip(targetTrackId, targetBeat) {
         id: Date.now() + Math.random(),
         patternId: clipboardClip.patternId,
         startBeat: startBeat,
-        loopCount: clipboardClip.loopCount
+        loopCount: clipboardClip.loopCount,
+        offset: clipboardClip.offset || 0,
+        loopLength: clipboardClip.loopLength,
+        isExpanded: clipboardClip.isExpanded || false,
+        trimOffset: clipboardClip.trimOffset,
+        trimLoopLength: clipboardClip.trimLoopLength,
+        trimLoopCount: clipboardClip.trimLoopCount
     };
 
     var trackId = targetTrackId !== undefined ? targetTrackId : state.selectedTrack;
@@ -2063,7 +3983,7 @@ function pasteClip(targetTrackId, targetBeat) {
 function handleTimelineMouseMove(e) {
     if (!clipDragState.active) return;
 
-    var deltaX = e.clientX - clipDragState.startX;
+    var deltaX = getScaledClientX(e) - clipDragState.startX;
     var deltaBeat = deltaX / timelinePixelsPerBeat;
 
     // Handle end marker dragging (snapped to measures)
@@ -2073,13 +3993,28 @@ function handleTimelineMouseMove(e) {
         // Snap to measure boundary
         newTotalBeats = snapToMeasureEnd(newTotalBeats);
 
-        // Ensure it's beyond the furthest clip
-        var minBeats = snapToMeasureEnd(getMaxClipEndBeat()) + getBeatsPerMeasure();
+        // Ensure it's beyond the furthest clip (at least 1 measure)
+        var minBeats = Math.max(getBeatsPerMeasure(), snapToMeasureEnd(getMaxClipEndBeat()));
         newTotalBeats = Math.max(minBeats, newTotalBeats);
 
         state.timeline.totalBeats = newTotalBeats;
         state.timeline.totalMeasures = beatsToMeasures(newTotalBeats);
         clipDragState.clipElement.style.left = (newTotalBeats * timelinePixelsPerBeat) + 'px';
+        var container = document.getElementById('timeline-tracks');
+        if (container) {
+            var content = container.querySelector('.timeline-content');
+            if (content) {
+                var totalWidth = newTotalBeats * timelinePixelsPerBeat;
+                content.style.width = totalWidth + 'px';
+                content.style.minWidth = totalWidth + 'px';
+            }
+        }
+        var ruler = document.getElementById('timeline-ruler');
+        if (ruler) {
+            var rulerWidth = newTotalBeats * timelinePixelsPerBeat;
+            ruler.style.width = rulerWidth + 'px';
+            ruler.style.minWidth = rulerWidth + 'px';
+        }
         updateMeasureDisplay();
         return;
     }
@@ -2120,6 +4055,24 @@ function handleTimelineMouseMove(e) {
         return;
     }
 
+    if (clipDragState.mode === 'move') {
+        var targetTrackId = getTimelineTrackIdAt(e.clientY);
+        if (targetTrackId !== null && targetTrackId !== clipDragState.currentTrackId) {
+            var moved = moveClipToTrack(clipDragState.clipId, clipDragState.currentTrackId, targetTrackId);
+            if (moved) {
+                clipDragState.currentTrackId = targetTrackId;
+                clipDragState.trackId = targetTrackId;
+                if (clipDragState.clipElement) {
+                    clipDragState.clipElement.setAttribute('data-track-id', targetTrackId);
+                    var targetRow = document.querySelector('.timeline-track-row[data-track-id="' + targetTrackId + '"]');
+                    if (targetRow && clipDragState.clipElement.parentNode !== targetRow) {
+                        targetRow.appendChild(clipDragState.clipElement);
+                    }
+                }
+            }
+        }
+    }
+
     var track = state.tracks[clipDragState.trackId];
     var clip = null;
     for (var i = 0; i < track.clips.length; i++) {
@@ -2130,6 +4083,48 @@ function handleTimelineMouseMove(e) {
     }
 
     if (!clip) return;
+
+    if (clipDragState.mode === 'expand-handle') {
+        var pattern = state.patterns[clip.patternId];
+        if (!pattern) return;
+
+        var lpb = pattern.lpb || state.lpb;
+        var grid = 1 / lpb;
+        var newBeats = clipDragState.startPatternBeats + deltaBeat;
+        newBeats = Math.max(grid, Math.round(newBeats / grid) * grid);
+
+        if (Math.abs(newBeats - clipDragState.lastPatternBeats) < 0.0001) return;
+
+        clipDragState.didDrag = true;
+        clipDragState.lastPatternBeats = newBeats;
+
+        var changed = applyPatternLengthWithBuffer(pattern, clip, newBeats);
+        if (!changed) return;
+
+        var duration = getClipDurationBeats(clip);
+        if (clipDragState.clipElement) {
+            var widthPx = Math.max(duration * timelinePixelsPerBeat - 2, 2);
+            clipDragState.clipElement.style.width = widthPx + 'px';
+            var noteCanvas = clipDragState.clipElement.querySelector('.clip-note-viz');
+            if (noteCanvas) {
+                noteCanvas.width = Math.max(widthPx, 1);
+                renderClipNotes(noteCanvas, pattern, clip);
+            }
+            var expandHandle = clipDragState.clipElement.querySelector('.clip-expand-handle');
+            if (expandHandle) {
+                var expandInfo = getClipExpandInfo(clip, pattern);
+                expandHandle.textContent = expandInfo.hasBuffer ? '+' : '\u2194';
+                if (expandInfo.expanded) {
+                    clipDragState.clipElement.classList.add('expanded');
+                } else {
+                    clipDragState.clipElement.classList.remove('expanded');
+                }
+            }
+        }
+
+        autoExtendTimeline();
+        return;
+    }
 
     if (clipDragState.mode === 'move') {
         // Move clip position (with optional measure snapping)
@@ -2151,14 +4146,17 @@ function handleTimelineMouseMove(e) {
         if (!pattern) return;
 
         // Calculate pattern length in beats
-        var patternLpb = pattern.lpb || state.lpb;
-        var patternBeats = pattern.steps / patternLpb;
+        var patternBeats = getPatternBeatsValue(pattern);
+        var loopLength = getClipLoopLength(clip, pattern);
 
         // Calculate new loop count based on drag distance
-        var loopsChange = deltaBeat / patternBeats;
+        var loopsChange = deltaBeat / (loopLength || patternBeats);
         var newLoopCount = Math.max(1, Math.round(clipDragState.startLoopCount + loopsChange));
 
         clip.loopCount = newLoopCount;
+        if (clip.loopLength === undefined || clip.loopLength === null) {
+            clip.loopLength = loopLength || patternBeats;
+        }
 
         // Update visual width
         var duration = getClipDurationBeats(clip);
@@ -2167,7 +4165,7 @@ function handleTimelineMouseMove(e) {
         // Update label in header
         var label = pattern.name || ('Pattern ' + (clip.patternId + 1));
         if (newLoopCount > 1) {
-            label += ' ×' + newLoopCount;
+            label += ' \u00D7' + newLoopCount;
         }
         var header = clipDragState.clipElement.querySelector('.clip-header');
         if (header) {
@@ -2177,25 +4175,29 @@ function handleTimelineMouseMove(e) {
         // Auto-extend timeline if clip resized beyond bounds
         autoExtendTimeline();
     } else if (clipDragState.mode === 'loop-handle') {
-        // Resize clip to any grid snap position (fractional loops)
+        // Resize clip to whole loop units (pattern-length snapping)
         var pattern = state.patterns[clip.patternId];
         if (!pattern) return;
 
-        var patternLpb = pattern.lpb || state.lpb;
-        var patternBeats = pattern.steps / patternLpb;
-        var gridSnap = state.timeline.gridSnap || 1;
+        var patternBeats = getPatternBeatsValue(pattern);
+        var loopLength = getClipLoopLength(clip, pattern);
+        var baseSnap = loopLength || patternBeats;
+        if (!baseSnap || baseSnap <= 0) baseSnap = state.timeline.gridSnap || 1;
 
         // Calculate new total duration snapped to grid
-        var oldDuration = patternBeats * clipDragState.startLoopCount - (clip.offset || 0);
+        var oldDuration = (loopLength || patternBeats) * clipDragState.startLoopCount;
         var newDuration = oldDuration + deltaBeat;
-        // Snap duration to grid
-        newDuration = Math.max(gridSnap, Math.round(newDuration / gridSnap) * gridSnap);
+        // Snap duration to pattern length so loops repeat only full pattern steps
+        newDuration = Math.max(baseSnap, Math.round(newDuration / baseSnap) * baseSnap);
         // Convert back to loopCount (accounting for offset)
-        var newLoopCount = (newDuration + (clip.offset || 0)) / patternBeats;
-        // Minimum: enough to fill at least one grid snap beyond offset
-        newLoopCount = Math.max((clip.offset || 0) / patternBeats + gridSnap / patternBeats, newLoopCount);
+        var newLoopCount = newDuration / (loopLength || patternBeats);
+        // Minimum: at least one full loop
+        newLoopCount = Math.max(1, newLoopCount);
 
         clip.loopCount = newLoopCount;
+        if (clip.loopLength === undefined || clip.loopLength === null) {
+            clip.loopLength = loopLength || patternBeats;
+        }
 
         // Update visual width
         var duration = getClipDurationBeats(clip);
@@ -2205,7 +4207,7 @@ function handleTimelineMouseMove(e) {
         var label = pattern.name || ('Pattern ' + (clip.patternId + 1));
         if (newLoopCount > 1) {
             var displayLoops = Math.round(newLoopCount * 100) / 100;
-            label += ' ×' + displayLoops;
+            label += ' \u00D7' + displayLoops;
         }
         var header = clipDragState.clipElement.querySelector('.clip-header');
         if (header) {
@@ -2218,11 +4220,37 @@ function handleTimelineMouseMove(e) {
 
 function handleTimelineMouseUp(e) {
     if (clipDragState.active) {
+        var wasExpand = clipDragState.mode === 'expand-handle';
+        var expandTrackId = clipDragState.trackId;
+        var expandClipId = clipDragState.clipId;
+        var expandDidDrag = clipDragState.didDrag;
         clipDragState.active = false;
         clipDragState.mode = null;
+        clipDragState.clipId = null;
+        clipDragState.trackId = null;
+        clipDragState.currentTrackId = null;
         clipDragState.clipElement = null;
+        clipDragState.didDrag = false;
         document.body.style.cursor = '';
         renderTimeline();  // Re-render to ensure proper state
+
+        if (wasExpand) {
+            clipDragState.suppressClick = expandDidDrag;
+            var expandClip = findClipById(expandTrackId, expandClipId);
+            var expandPattern = expandClip ? state.patterns[expandClip.patternId] : null;
+            if (expandPattern && expandPattern._needsGridRefresh) {
+                var patternIndex = getPatternIndex(expandPattern);
+                invalidatePatternCache(patternIndex);
+                expandPattern._needsGridRefresh = false;
+            }
+            if (state.selectedClip &&
+                state.selectedClip.clipId === expandClipId &&
+                state.selectedClip.trackId === expandTrackId) {
+                setPrimaryClip(expandTrackId, expandClipId);
+            }
+        } else {
+            clipDragState.suppressClick = false;
+        }
     }
 }
 
@@ -2251,7 +4279,10 @@ function handleTimelineDblClick(e) {
     if (row) {
         var trackId = parseInt(row.getAttribute('data-track-id'));
         var rect = row.getBoundingClientRect();
-        var x = e.clientX - rect.left;
+        var scale = getUiScale();
+        var container = document.getElementById('timeline-tracks');
+        var scrollX = container ? container.scrollLeft : 0;
+        var x = (e.clientX - rect.left) / scale + scrollX;
         var beat = Math.floor(x / timelinePixelsPerBeat);
 
         // Always create a new pattern for each new clip
@@ -2269,22 +4300,237 @@ function handleTimelineDblClick(e) {
 }
 
 function openClipInEditor(trackId, clipId) {
-    var track = state.tracks[trackId];
-    if (!track) return;
+    var clip = findClipById(trackId, clipId);
+    if (!clip) return;
+    switchEditorView('song');
+    setPatternCollapsed(false);
+    selectClip(trackId, clipId);
+    consoleLog('Editing pattern ' + (clip.patternId + 1) + ' from track ' + (trackId + 1));
+}
 
-    for (var i = 0; i < track.clips.length; i++) {
-        if (track.clips[i].id === clipId) {
-            var patternIdx = track.clips[i].patternId;
-            // Set the selected clip (DAW-style)
-            state.selectedClip = { trackId: trackId, clipId: clipId };
-            state.focusedTrack = trackId;
-            state.selectedTrack = trackId;
-            renderTrackerGrid(true);
-            renderTrackList();
-            consoleLog('Editing pattern ' + (patternIdx + 1) + ' from track ' + (trackId + 1));
-            break;
+function getContextClipSelection() {
+    if (timelineContextState.clipId === null) return [];
+    if (selectedClips.length > 0) {
+        for (var i = 0; i < selectedClips.length; i++) {
+            if (selectedClips[i].trackId === timelineContextState.trackId &&
+                selectedClips[i].clipId === timelineContextState.clipId) {
+                return selectedClips.slice();
+            }
         }
     }
+    return [{ trackId: timelineContextState.trackId, clipId: timelineContextState.clipId }];
+}
+
+function clonePatternFromPattern(pattern, trackId) {
+    var cloned = JSON.parse(JSON.stringify(pattern));
+    cloned.id = state.patterns.length;
+    cloned.trackId = trackId || 0;
+    var baseName = pattern.name || (pattern.type === 'piano' ? 'Piano' : 'Pattern');
+    cloned.name = baseName + ' (unique)';
+    state.patterns.push(cloned);
+    return cloned.id;
+}
+
+function makeSelectedClipsUnique() {
+    var clips = getContextClipSelection();
+    if (clips.length === 0) {
+        consoleLog('No clip selected');
+        return;
+    }
+
+    for (var i = 0; i < clips.length; i++) {
+        var clip = findClipById(clips[i].trackId, clips[i].clipId);
+        if (!clip) continue;
+        var pattern = state.patterns[clip.patternId];
+        if (!pattern) continue;
+        var newPatternId = clonePatternFromPattern(pattern, clips[i].trackId);
+        clip.patternId = newPatternId;
+    }
+
+    renderTimeline();
+    if (state.selectedClip && state.selectedClip.clipId !== null) {
+        setPrimaryClip(state.selectedClip.trackId, state.selectedClip.clipId);
+    }
+    consoleLog('Made pattern unique');
+}
+
+function fxHexToFloatValue(fxStr) {
+    if (!fxStr || fxStr === '--' || fxStr === '----') return 0;
+    var val = parseInt(fxStr, 16);
+    if (isNaN(val)) return 0;
+    return val / 65535;
+}
+
+function fxFloatToHexValue(val) {
+    if (typeof val !== 'number' || !isFinite(val)) return '0000';
+    var clamped = Math.max(0, Math.min(1, val));
+    return Math.round(clamped * 65535).toString(16).toUpperCase().padStart(4, '0');
+}
+
+function convertTrackerPatternToPiano(pattern) {
+    if (!pattern) return;
+    if (pattern.data && (!pattern.notes || pattern.notes.length === 0)) {
+        pattern.notes = trackerDataToNotes(pattern);
+    }
+
+    var lpb = pattern.lpb || state.lpb;
+    var beats = (pattern.steps || 16) / lpb;
+    var events = pattern.notes || [];
+    var notes = [];
+
+    for (var i = 0; i < events.length; i++) {
+        var ev = events[i];
+        if (!isNoteEvent(ev)) continue;
+        var startBeat = Math.max(0, Math.min(beats, ev.startBeat || 0));
+
+        var endBeat = null;
+        for (var j = 0; j < events.length; j++) {
+            if (i === j) continue;
+            var other = events[j];
+            if (!other || (other.column || 0) !== (ev.column || 0)) continue;
+            if (other.startBeat <= startBeat) continue;
+            if (isNoteEvent(other) || (isCellEvent(other) && other.note === NOTE_OFF)) {
+                if (endBeat === null || other.startBeat < endBeat) {
+                    endBeat = other.startBeat;
+                }
+            }
+        }
+
+        var duration = null;
+        if (endBeat === null || endBeat <= startBeat) {
+            duration = 1 / lpb;
+        } else {
+            duration = Math.max(1 / lpb, Math.min(beats - startBeat, endBeat - startBeat));
+        }
+
+        var fxArr = [];
+        if (ev.fx && ev.fx.length) {
+            for (var fx = 0; fx < ev.fx.length; fx++) {
+                fxArr.push(fxHexToFloatValue(ev.fx[fx]));
+            }
+        }
+
+        notes.push({
+            type: 'note',
+            pitch: ev.pitch,
+            startBeat: startBeat,
+            duration: duration,
+            velocity: ev.velocity,
+            column: ev.column || 0,
+            fx: fxArr
+        });
+    }
+
+    pattern.type = 'piano';
+    pattern.beats = beats;
+    pattern.steps = Math.round(beats * lpb);
+    pattern.noteColumns = 1;
+    pattern.fxColumns = [0];
+    pattern.notes = notes;
+    pattern._bufferNotes = undefined;
+    pattern._bufferBeats = undefined;
+}
+
+function convertPianoPatternToTracker(pattern) {
+    if (!pattern) return;
+    var lpb = pattern.lpb || state.lpb;
+    var beats = pattern.beats || 4;
+    var steps = Math.max(1, Math.round(beats * lpb));
+    var grid = 1 / lpb;
+
+    var notes = pattern.notes || [];
+    var events = [];
+    var maxFx = 0;
+    var maxCol = 0;
+
+    for (var i = 0; i < notes.length; i++) {
+        var note = notes[i];
+        if (!isNoteEvent(note)) continue;
+
+        var startBeat = Math.max(0, Math.round(note.startBeat / grid) * grid);
+        var duration = (typeof note.duration === 'number' && note.duration > 0) ? note.duration : grid;
+        var endBeat = Math.round((startBeat + duration) / grid) * grid;
+        if (endBeat <= startBeat) endBeat = startBeat + grid;
+        if (endBeat > beats) endBeat = beats;
+        var col = note.column || 0;
+        if (col > maxCol) maxCol = col;
+
+        var fxArr = [];
+        if (note.fx && note.fx.length) {
+            for (var fx = 0; fx < note.fx.length; fx++) {
+                var fxVal = note.fx[fx];
+                if (typeof fxVal === 'number') {
+                    fxArr.push(fxFloatToHexValue(fxVal));
+                } else if (typeof fxVal === 'string' && fxVal !== '' && fxVal !== '--' && fxVal !== '----') {
+                    fxArr.push(fxVal.toString().toUpperCase().padStart(4, '0'));
+                }
+            }
+        }
+        maxFx = Math.max(maxFx, fxArr.length);
+
+        events.push({
+            type: 'note',
+            pitch: note.pitch,
+            startBeat: startBeat,
+            duration: null,
+            velocity: note.velocity,
+            column: col,
+            fx: fxArr
+        });
+
+        if (endBeat < beats - 0.0001) {
+            events.push({
+                type: 'cell',
+                startBeat: endBeat,
+                column: col,
+                note: NOTE_OFF,
+                amp: '',
+                fx: []
+            });
+        }
+    }
+
+    pattern.type = 'tracker';
+    pattern.steps = steps;
+    pattern.beats = steps / lpb;
+    pattern.noteColumns = maxCol + 1;
+    pattern.fxColumns = [];
+    for (var c = 0; c < pattern.noteColumns; c++) {
+        pattern.fxColumns.push(maxFx);
+    }
+    pattern.notes = events;
+    pattern._bufferNotes = undefined;
+    pattern._bufferBeats = undefined;
+    notesToTrackerData(pattern);
+}
+
+function convertSelectedClipPattern() {
+    var clips = getContextClipSelection();
+    if (clips.length === 0) {
+        consoleLog('No clip selected');
+        return;
+    }
+
+    var primary = clips[0];
+    var clip = findClipById(primary.trackId, primary.clipId);
+    if (!clip) return;
+    var pattern = state.patterns[clip.patternId];
+    if (!pattern) return;
+
+    var oldBeats = getPatternBeatsValue(pattern);
+    if (pattern.type === 'piano') {
+        convertPianoPatternToTracker(pattern);
+    } else {
+        convertTrackerPatternToPiano(pattern);
+    }
+    var newBeats = getPatternBeatsValue(pattern);
+    if (clip.loopLength === undefined || clip.loopLength === null || Math.abs(clip.loopLength - oldBeats) < 0.0001) {
+        clip.loopLength = newBeats;
+    }
+
+    renderTimeline();
+    setPrimaryClip(primary.trackId, primary.clipId);
+    consoleLog('Converted pattern type');
 }
 
 // ============================================
@@ -2307,16 +4553,29 @@ function clonePattern() {
 
 // Delete the currently selected clip
 function deleteSelectedClip() {
-    if (!state.selectedClip || state.selectedClip.trackId === null || state.selectedClip.clipId === null) {
+    deleteSelectedClips();
+}
+
+function deleteSelectedClips() {
+    var list = collectSelectedClips();
+    if (list.length === 0) {
         consoleLog('No clip selected');
         return;
     }
-    removeClipFromTrack(state.selectedClip.trackId, state.selectedClip.clipId);
-    state.selectedClip = { trackId: null, clipId: null };
+
+    pushUndo('clip-edit', captureStateForUndo('clip-edit'));
+
+    for (var i = 0; i < list.length; i++) {
+        removeClipFromTrack(list[i].trackId, list[i].clipId);
+    }
+
+    applyClipSelection([], null);
+    cleanupUnusedPatterns();
     currentGridPatternIndex = -1;
     renderTimeline();
-    renderTrackerGrid();
-    consoleLog('Deleted clip');
+    renderTrackList();
+    renderTrackerGrid(true);
+    consoleLog('Deleted ' + list.length + ' clip(s)');
 }
 
 function applyStepCount() {
@@ -2337,6 +4596,9 @@ function applyPatternSteps() {
     if (!pattern) return;
 
     var oldSteps = pattern.steps;
+    var oldLpb = pattern.lpb || state.lpb;
+    var oldBeats = (oldSteps || 0) / (oldLpb || state.lpb);
+    var ratio = (oldLpb && newLpb) ? (oldLpb / newLpb) : 1;
 
     // Update LPB
     pattern.lpb = newLpb;
@@ -2344,17 +4606,70 @@ function applyPatternSteps() {
     // Update steps if changed
     if (newSteps !== oldSteps) {
         pattern.steps = newSteps;
+    }
 
-        // Handle single-track pattern (new format)
-        if (!Array.isArray(pattern.data[0])) {
-            if (newSteps > oldSteps) {
-                for (var step = oldSteps; step < newSteps; step++) {
-                    pattern.data[step] = { note: '', amp: '', params: [] };
-                }
-            } else {
-                pattern.data.length = newSteps;
+    if (Math.abs(ratio - 1) >= 0.000001) {
+        scaleEventsByRatio(pattern.notes, ratio);
+        if (pattern._bufferNotes) {
+            scaleEventsByRatio(pattern._bufferNotes, ratio);
+        }
+        if (pattern._bufferBeats !== undefined && pattern._bufferBeats !== null) {
+            pattern._bufferBeats *= ratio;
+        }
+
+        for (var ti = 0; ti < state.tracks.length; ti++) {
+            var clips = state.tracks[ti].clips;
+            for (var ci = 0; ci < clips.length; ci++) {
+                var clip = clips[ci];
+                if (clip.patternId !== patternIndex) continue;
+                if (typeof clip.offset === 'number') clip.offset *= ratio;
+                if (clip.loopLength !== undefined && clip.loopLength !== null) clip.loopLength *= ratio;
+                if (clip.trimOffset !== undefined && clip.trimOffset !== null) clip.trimOffset *= ratio;
+                if (clip.trimLoopLength !== undefined && clip.trimLoopLength !== null) clip.trimLoopLength *= ratio;
             }
         }
+    }
+
+    // Update beats derived from steps/lpb (tracker patterns)
+    pattern.beats = pattern.steps / (pattern.lpb || state.lpb);
+    var newBeats = pattern.beats;
+
+    // Keep clip loop length in sync with pattern length unless explicitly trimmed
+    for (var ti2 = 0; ti2 < state.tracks.length; ti2++) {
+        var clips2 = state.tracks[ti2].clips;
+        for (var ci2 = 0; ci2 < clips2.length; ci2++) {
+            var clip2 = clips2[ci2];
+            if (clip2.patternId !== patternIndex) continue;
+            if (clip2.loopLength === undefined || clip2.loopLength === null ||
+                Math.abs(clip2.loopLength - oldBeats) < 0.0001) {
+                clip2.loopLength = newBeats;
+            }
+            if (typeof clip2.offset === 'number' && newBeats > 0) {
+                clip2.offset = clip2.offset % newBeats;
+            }
+        }
+    }
+
+    if (Math.abs(ratio - 1) >= 0.000001) {
+        var maxBeats = pattern.beats;
+        for (var tj = 0; tj < state.tracks.length; tj++) {
+            var tclips = state.tracks[tj].clips;
+            for (var cj = 0; cj < tclips.length; cj++) {
+                var c = tclips[cj];
+                if (c.patternId !== patternIndex) continue;
+                if (typeof c.offset === 'number' && maxBeats > 0) {
+                    c.offset = c.offset % maxBeats;
+                }
+            }
+        }
+    }
+
+    // Trim events beyond new length
+    if (pattern.notes && pattern.notes.length > 0) {
+        var maxBeat = pattern.beats;
+        pattern.notes = pattern.notes.filter(function(ev) {
+            return ev && ev.startBeat < maxBeat + 0.0001;
+        });
     }
 
     invalidatePatternCache(patternIndex);
@@ -2367,6 +4682,69 @@ function markPatternDirty(patternIndex) {
     if (patternGridCache[patternIndex]) {
         patternGridCache[patternIndex]._dirty = true;
     }
+
+    markPatternNoteVizDirty(patternIndex);
+}
+
+var patternNoteVizDirty = {};
+var pendingNoteVizRefresh = null;
+
+function getPatternIndex(pattern) {
+    if (!pattern) return -1;
+    return state.patterns.indexOf(pattern);
+}
+
+function markPatternNoteVizDirty(patternIndex) {
+    if (patternIndex === null || patternIndex === undefined || patternIndex < 0) return;
+    patternNoteVizDirty[patternIndex] = true;
+    scheduleNoteVizRefresh();
+}
+
+function markPatternNoteVizDirtyForPattern(pattern) {
+    var idx = getPatternIndex(pattern);
+    if (idx >= 0) {
+        markPatternNoteVizDirty(idx);
+    }
+}
+
+function scheduleNoteVizRefresh() {
+    if (state.isPlaying) return;
+    if (pendingNoteVizRefresh) return;
+    pendingNoteVizRefresh = requestAnimationFrame(function() {
+        pendingNoteVizRefresh = null;
+        flushPatternNoteVizDirty();
+    });
+}
+
+function refreshClipNoteVizForPattern(patternIndex) {
+    var pattern = state.patterns[patternIndex];
+    if (!pattern) return;
+
+    var clipEls = document.querySelectorAll('.timeline-clip[data-pattern-id="' + patternIndex + '"]');
+    for (var i = 0; i < clipEls.length; i++) {
+        var clipEl = clipEls[i];
+        var trackId = parseInt(clipEl.getAttribute('data-track-id'));
+        var clipId = parseFloat(clipEl.getAttribute('data-clip-id'));
+        var clip = findClipById(trackId, clipId);
+        var canvas = clipEl.querySelector('.clip-note-viz');
+        if (canvas && clip) {
+            renderClipNotes(canvas, pattern, clip);
+        }
+    }
+}
+
+function flushPatternNoteVizDirty() {
+    var keys = Object.keys(patternNoteVizDirty);
+    if (keys.length === 0) return;
+
+    for (var i = 0; i < keys.length; i++) {
+        var idx = parseInt(keys[i]);
+        if (!isNaN(idx)) {
+            refreshClipNoteVizForPattern(idx);
+        }
+    }
+
+    patternNoteVizDirty = {};
 }
 
 function invalidatePatternCache(patternIndex) {
@@ -2460,9 +4838,18 @@ function buildPatternGridContainer(patternIndex) {
         noteColLabels.className = 'note-column-group';
         noteColLabels.setAttribute('data-note-col', nc);
 
-        // Note and velocity labels
-        noteColLabels.innerHTML = '<div class="cell note-label">Note</div>' +
-                                   '<div class="cell amp-label">Vel</div>';
+        // Per-note-column FX +/- buttons
+        var fxBtns = document.createElement('div');
+        fxBtns.className = 'fx-col-controls';
+        fxBtns.innerHTML =
+            '<button class="btn-fx-minus" data-pattern="' + patternIndex + '" data-note-col="' + nc + '" title="Remove p-field">-p</button>' +
+            '<button class="btn-fx-plus" data-pattern="' + patternIndex + '" data-note-col="' + nc + '" title="Add p-field">+p</button>';
+
+        // Labels row for this note column (Note/Vel + FX labels)
+        var labelsInner = document.createElement('div');
+        labelsInner.className = 'note-column-labels';
+        labelsInner.innerHTML = '<div class="cell note-label">Note</div>' +
+                                '<div class="cell amp-label">Vel</div>';
 
         // FX column labels for this note column (p6, p7, p8, etc.)
         var fxCount = getFxCount(pattern, nc);
@@ -2470,43 +4857,20 @@ function buildPatternGridContainer(patternIndex) {
             var fxLabel = document.createElement('div');
             fxLabel.className = 'cell fx-label';
             fxLabel.textContent = 'p' + (6 + fx);
-            noteColLabels.appendChild(fxLabel);
+            labelsInner.appendChild(fxLabel);
         }
 
-        // Per-note-column FX +/- buttons
-        var fxBtns = document.createElement('div');
-        fxBtns.className = 'fx-col-controls';
-        fxBtns.innerHTML =
-            '<button class="btn-fx-minus" data-pattern="' + patternIndex + '" data-note-col="' + nc + '" title="Remove p-field">-p</button>' +
-            '<button class="btn-fx-plus" data-pattern="' + patternIndex + '" data-note-col="' + nc + '" title="Add p-field">+p</button>';
         noteColLabels.appendChild(fxBtns);
+        noteColLabels.appendChild(labelsInner);
 
         labelsRow.appendChild(noteColLabels);
     }
 
     rows.appendChild(labelsRow);
 
-    // Ensure pattern data has proper structure
-    for (var step = 0; step < pattern.steps; step++) {
-        if (!pattern.data[step]) {
-            pattern.data[step] = { columns: [] };
-        }
-        if (!pattern.data[step].columns) {
-            pattern.data[step].columns = [];
-        }
-        // Ensure we have enough columns
-        while (pattern.data[step].columns.length < numNoteCols) {
-            pattern.data[step].columns.push({ note: '', amp: '', fx: [] });
-        }
-        // Ensure each column has enough FX
-        for (var nc = 0; nc < numNoteCols; nc++) {
-            var col = pattern.data[step].columns[nc];
-            if (!col.fx) col.fx = [];
-            var expectedFx = getFxCount(pattern, nc);
-            while (col.fx.length < expectedFx) {
-                col.fx.push('');
-            }
-        }
+    // Ensure pattern has notes array (convert legacy data if needed)
+    if (!pattern.notes || pattern.notes.length === 0) {
+        pattern.notes = pattern.data ? trackerDataToNotes(pattern) : [];
     }
 
     // Data rows
@@ -2522,6 +4886,7 @@ function buildPatternGridContainer(patternIndex) {
 }
 
 // Create data row for single-track pattern with multiple note columns
+// Uses unified notes array - derives display from getNoteAtStep
 function createDataRowSingle(step, pattern) {
     var row = document.createElement('div');
     row.className = 'track-row';
@@ -2533,12 +4898,14 @@ function createDataRowSingle(step, pattern) {
     rowNum.textContent = step.toString().padStart(3, '0');
     row.appendChild(rowNum);
 
-    var stepData = pattern.data[step] || { columns: [{ note: '', amp: '', fx: [] }] };
     var numNoteCols = pattern.noteColumns || 1;
 
-    // Render each note column
+    // Render each note column from unified events
     for (var nc = 0; nc < numNoteCols; nc++) {
-        var colData = stepData.columns[nc] || { note: '', amp: '', fx: [] };
+        var cellData = getTrackerCellDisplay(pattern, step, nc);
+        var noteName = cellData.noteName;
+        var ampStr = cellData.ampStr;
+        var fxArr = cellData.fxArr;
 
         var noteColEl = document.createElement('div');
         noteColEl.className = 'note-column-group';
@@ -2550,8 +4917,8 @@ function createDataRowSingle(step, pattern) {
         noteCell.setAttribute('data-step', step);
         noteCell.setAttribute('data-note-col', nc);
         noteCell.setAttribute('data-type', 'note');
-        noteCell.textContent = colData.note || '---';
-        if (colData.note === NOTE_OFF) {
+        noteCell.textContent = noteName || '---';
+        if (noteName === NOTE_OFF) {
             noteCell.classList.add('note-off');
         }
         noteColEl.appendChild(noteCell);
@@ -2562,7 +4929,7 @@ function createDataRowSingle(step, pattern) {
         ampCell.setAttribute('data-step', step);
         ampCell.setAttribute('data-note-col', nc);
         ampCell.setAttribute('data-type', 'amp');
-        ampCell.textContent = colData.amp || '--';
+        ampCell.textContent = ampStr || '--';
         noteColEl.appendChild(ampCell);
 
         // FX cells for this note column
@@ -2575,7 +4942,7 @@ function createDataRowSingle(step, pattern) {
             fxCell.setAttribute('data-col', fx);
             fxCell.setAttribute('data-type', 'fx');
 
-            var fxVal = colData.fx[fx];
+            var fxVal = fxArr[fx];
             if (fxVal && fxVal !== '' && fxVal !== '--' && fxVal !== '----') {
                 var numVal = parseInt(fxVal, 16);
                 if (!isNaN(numVal)) {
@@ -2621,6 +4988,9 @@ function renderTrackerGrid(forceRebuild) {
     }
 
     if (!forceRebuild && currentGridPatternIndex === patternIndex) {
+        if (!state.isPlaying) {
+            flushPatternNoteVizDirty();
+        }
         return;
     }
 
@@ -2669,6 +5039,10 @@ function renderTrackerGrid(forceRebuild) {
         if (lpbInput) lpbInput.value = pattern.lpb || state.lpb;
         if (titleEl) titleEl.textContent = 'Pattern ' + (patternIndex + 1) + ': ' + (pattern.name || 'Untitled');
     }
+
+    if (!state.isPlaying) {
+        flushPatternNoteVizDirty();
+    }
 }
 
 // ============================================
@@ -2698,6 +5072,7 @@ function attachGridEvents(grid) {
 
 function onGridContextMenu(e) {
     e.preventDefault();
+    uiFocus = 'tracker';
 
     var cell = findCell(e.target);
     if (cell) {
@@ -2721,6 +5096,7 @@ function onGridContextMenu(e) {
 }
 
 function onGridMouseDown(e) {
+    uiFocus = 'tracker';
     var cell = findCell(e.target);
     if (!cell) return;
 
@@ -2922,6 +5298,19 @@ function onGridDblClick(e) {
 }
 
 function onDocumentKeyDown(e) {
+    var isCodeEditor = e.target && (e.target.id === 'code-editor' || e.target.id === 'opcodes-editor');
+    if (isCodeEditor && e.altKey && (e.code === 'KeyC' || e.key === 'c' || e.key === 'C')) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.target.id === 'code-editor') {
+            compileCurrentInstrumentIfChanged();
+        } else {
+            saveOpcodes();
+            compileOpcodesIfChanged();
+        }
+        return;
+    }
+
     // Skip if in textarea or other input (except our edit input)
     if (e.target.tagName === 'TEXTAREA') return;
     if (e.target.tagName === 'INPUT' && e.target !== editInput) return;
@@ -2929,12 +5318,39 @@ function onDocumentKeyDown(e) {
     // If editing, let the edit input handle it
     if (editingCell && e.target === editInput) return;
 
-    // Code editor shortcuts
-    if (e.target.id === 'code-editor' || e.target.id === 'opcodes-editor') {
-        if (e.altKey && e.code === 'Space') {
-            e.preventDefault();
-            compileInstruments();
-        }
+    // Undo/Redo (Ctrl+Z / Ctrl+Y)
+    if (e.ctrlKey && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) {
+        e.preventDefault();
+        undo();
+        return;
+    }
+    if (e.ctrlKey && (e.key === 'y' || e.key === 'Y')) {
+        e.preventDefault();
+        redo();
+        return;
+    }
+
+    // Cut/Copy/Paste (Ctrl+X/C/V)
+    if (e.ctrlKey && (e.key === 'x' || e.key === 'X')) {
+        e.preventDefault();
+        cutSelection();
+        return;
+    }
+    if (e.ctrlKey && (e.key === 'c' || e.key === 'C')) {
+        e.preventDefault();
+        copySelection();
+        return;
+    }
+    if (e.ctrlKey && (e.key === 'v' || e.key === 'V')) {
+        e.preventDefault();
+        pasteSelection();
+        return;
+    }
+
+    // Select All (Ctrl+A)
+    if (e.ctrlKey && (e.key === 'a' || e.key === 'A')) {
+        e.preventDefault();
+        selectAll();
         return;
     }
 
@@ -3045,6 +5461,13 @@ function onDocumentKeyDown(e) {
         return;
     }
 
+    // Timeline delete (Delete/Backspace)
+    if (uiFocus === 'timeline' && (e.key === 'Delete' || e.key === 'Backspace')) {
+        e.preventDefault();
+        deleteSelectedClips();
+        return;
+    }
+
     // Selection-based shortcuts
     if (selection.active && selectedCells.length > 0) {
         // Ctrl+C - copy
@@ -3064,7 +5487,7 @@ function onDocumentKeyDown(e) {
         // Ctrl+V - paste
         if (e.ctrlKey && e.key === 'v') {
             e.preventDefault();
-            pasteAtSelection();
+            pasteSelection();
             return;
         }
 
@@ -3130,9 +5553,16 @@ function onDocumentKeyDown(e) {
         var key = e.key.toLowerCase();
         if (keyboardMap.hasOwnProperty(key)) {
             e.preventDefault();
-            var semitone = keyboardMap[key];
-            var noteName = semitoneToNoteName(semitone, state.baseOctave);
-            recordNote(noteName);
+            var pattern = getCurrentPattern();
+            if (pattern && pattern.type === 'piano' && uiFocus === 'piano') {
+                var semitone = keyboardMap[key];
+                var pitch = (state.baseOctave + 1) * 12 + semitone;
+                startPianoRollRecordNote(pitch, 100);
+            } else {
+                var semitone = keyboardMap[key];
+                var noteName = semitoneToNoteName(semitone, state.baseOctave);
+                recordNote(noteName);
+            }
             // Note: preview is handled at the top of this function
         }
     }
@@ -3147,6 +5577,12 @@ function onDocumentKeyUp(e) {
     var key = e.key.toLowerCase();
     if (keyboardMap.hasOwnProperty(key)) {
         stopNotePreview(key);
+        var pattern = getCurrentPattern();
+        if (state.isRecording && pattern && pattern.type === 'piano' && uiFocus === 'piano') {
+            var semitone = keyboardMap[key];
+            var pitch = (state.baseOctave + 1) * 12 + semitone;
+            finishPianoRollRecordNote(pitch);
+        }
     }
 }
 
@@ -3498,25 +5934,136 @@ function onEditInputKeyDown(e) {
 function setCellValue(step, noteCol, fxCol, type, value) {
     var patternIndex = getCurrentPatternIndex();
     var pattern = getCurrentPattern();
-    var stepData = pattern.data[step];
-    if (!stepData || !stepData.columns) return;
+    if (!pattern) return;
 
-    // Ensure column exists
-    while (stepData.columns.length <= noteCol) {
-        stepData.columns.push({ note: '', amp: '', fx: [] });
+    var info = findTrackerEventsAtStep(pattern, step, noteCol);
+    var noteEvent = info.noteEvent;
+    var cellEvent = info.cellEvent;
+    var stepBeat = info.stepBeat;
+    var events = ensurePatternNotes(pattern);
+
+    function ensureCellEvent() {
+        if (!cellEvent) {
+            cellEvent = { type: 'cell', startBeat: stepBeat, column: noteCol, note: '', amp: '', fx: [] };
+            events.push(cellEvent);
+        }
     }
-    var colData = stepData.columns[noteCol];
+
+    function cleanupCellEvent() {
+        if (!cellEvent) return;
+        var hasAmp = cellEvent.amp && cellEvent.amp !== '--';
+        var hasFx = hasFxValues(cellEvent.fx);
+        var hasNote = cellEvent.note && cellEvent.note !== '';
+        if (!hasAmp && !hasFx && !hasNote) {
+            removeEvent(events, cellEvent);
+            cellEvent = null;
+        }
+    }
 
     if (type === 'note') {
-        colData.note = value;
-    } else if (type === 'amp') {
-        colData.amp = value;
-    } else if (type === 'fx') {
-        if (!colData.fx) colData.fx = [];
-        while (colData.fx.length <= fxCol) {
-            colData.fx.push('');
+        if (!value || value === '---') {
+            // Clear note, preserve amp/fx in a cell event if present
+            if (noteEvent) {
+                var ampHex = velocityToHex(noteEvent.velocity);
+                var fxCopy = noteEvent.fx ? noteEvent.fx.slice() : [];
+                if ((ampHex && ampHex !== '--') || hasFxValues(fxCopy)) {
+                    ensureCellEvent();
+                    if (ampHex && ampHex !== '--') cellEvent.amp = ampHex;
+                    if (hasFxValues(fxCopy)) cellEvent.fx = fxCopy;
+                }
+                removeEvent(events, noteEvent);
+                noteEvent = null;
+            }
+            if (cellEvent && cellEvent.note === NOTE_OFF) {
+                cellEvent.note = '';
+                cleanupCellEvent();
+            }
+        } else if (value === NOTE_OFF) {
+            // Note-off cell
+            if (noteEvent) {
+                var ampHex = velocityToHex(noteEvent.velocity);
+                var fxCopy = noteEvent.fx ? noteEvent.fx.slice() : [];
+                ensureCellEvent();
+                if (ampHex && ampHex !== '--') cellEvent.amp = ampHex;
+                if (hasFxValues(fxCopy)) cellEvent.fx = fxCopy;
+                removeEvent(events, noteEvent);
+                noteEvent = null;
+            }
+            ensureCellEvent();
+            cellEvent.note = NOTE_OFF;
+        } else {
+            // Normal note
+            var pitch = noteNameToMidi(value);
+            if (pitch === null) return;
+
+            if (!noteEvent) {
+                noteEvent = {
+                    type: 'note',
+                    pitch: pitch,
+                    startBeat: stepBeat,
+                    duration: null,
+                    velocity: null,
+                    column: noteCol,
+                    fx: []
+                };
+                events.push(noteEvent);
+            } else {
+                noteEvent.pitch = pitch;
+            }
+
+            // Transfer amp/fx from cell event if present
+            if (cellEvent) {
+                if (cellEvent.amp && cellEvent.amp !== '--') {
+                    noteEvent.velocity = hexToVelocity(cellEvent.amp);
+                }
+                if (cellEvent.fx && cellEvent.fx.length > 0) {
+                    noteEvent.fx = cellEvent.fx.slice();
+                }
+                if (cellEvent.note === NOTE_OFF) cellEvent.note = '';
+                cellEvent.amp = '';
+                cellEvent.fx = [];
+                cleanupCellEvent();
+            }
         }
-        colData.fx[fxCol] = value;
+    } else if (type === 'amp') {
+        if (noteEvent) {
+            noteEvent.velocity = value ? hexToVelocity(value) : null;
+        } else {
+            if (!value) {
+                if (cellEvent) {
+                    cellEvent.amp = '';
+                    cleanupCellEvent();
+                }
+            } else {
+                ensureCellEvent();
+                cellEvent.amp = value;
+            }
+        }
+    } else if (type === 'fx') {
+        if (noteEvent) {
+            if (!noteEvent.fx) noteEvent.fx = [];
+            while (noteEvent.fx.length <= fxCol) {
+                noteEvent.fx.push('');
+            }
+            noteEvent.fx[fxCol] = value || '';
+            trimFxArray(noteEvent.fx);
+        } else {
+            if (!value) {
+                if (cellEvent && cellEvent.fx) {
+                    cellEvent.fx[fxCol] = '';
+                    trimFxArray(cellEvent.fx);
+                    cleanupCellEvent();
+                }
+            } else {
+                ensureCellEvent();
+                if (!cellEvent.fx) cellEvent.fx = [];
+                while (cellEvent.fx.length <= fxCol) {
+                    cellEvent.fx.push('');
+                }
+                cellEvent.fx[fxCol] = value;
+                trimFxArray(cellEvent.fx);
+            }
+        }
     }
 
     markPatternDirty(patternIndex);
@@ -3822,19 +6369,8 @@ function showContextMenu(x, y) {
         }
     }
 
-    // Position menu
-    contextMenu.style.left = x + 'px';
-    contextMenu.style.top = y + 'px';
     contextMenu.classList.add('visible');
-
-    // Ensure menu stays within viewport
-    var rect = contextMenu.getBoundingClientRect();
-    if (rect.right > window.innerWidth) {
-        contextMenu.style.left = (x - rect.width) + 'px';
-    }
-    if (rect.bottom > window.innerHeight) {
-        contextMenu.style.top = (y - rect.height) + 'px';
-    }
+    positionMenuAtClient(contextMenu, x, y);
 }
 
 function hideContextMenu() {
@@ -3863,7 +6399,7 @@ function interpolateFxSelection() {
     var pattern = getCurrentPattern();
     var patternIndex = getCurrentPatternIndex();
 
-    if (!pattern || !pattern.data) {
+    if (!pattern) {
         consoleLog('No pattern selected');
         return;
     }
@@ -3873,13 +6409,7 @@ function interpolateFxSelection() {
     for (var i = 0; i < selectedCells.length; i++) {
         var info = getCellInfo(selectedCells[i]);
         if (info && info.type === 'fx') {
-            // Get FX value from the new pattern structure: pattern.data[step].columns[noteCol].fx[col]
-            var stepData = pattern.data[info.step];
-            if (!stepData || !stepData.columns || !stepData.columns[info.noteCol]) {
-                continue;
-            }
-            var colData = stepData.columns[info.noteCol];
-            var fxStr = colData.fx && colData.fx[info.col] ? colData.fx[info.col] : '';
+            var fxStr = getTrackerFxValue(pattern, info.step, info.noteCol, info.col);
             var value = null;
             if (fxStr && fxStr !== '' && fxStr !== '--' && fxStr !== '----') {
                 value = parseInt(fxStr, 16);
@@ -3943,19 +6473,10 @@ function interpolateFxSelection() {
             // Clamp to 0-65535 (hex 0000-FFFF)
             interpolatedValue = Math.max(0, Math.min(65535, interpolatedValue));
 
-            // Set the value in the new pattern structure
+            // Set the value in the unified events
             var hexValue = interpolatedValue.toString(16).toUpperCase().padStart(4, '0');
-            var stepData = pattern.data[cell.info.step];
-            if (stepData && stepData.columns && stepData.columns[cell.info.noteCol]) {
-                var colData = stepData.columns[cell.info.noteCol];
-                // Ensure fx array exists and is large enough
-                if (!colData.fx) colData.fx = [];
-                while (colData.fx.length <= cell.info.col) {
-                    colData.fx.push('');
-                }
-                colData.fx[cell.info.col] = hexValue;
-                updateCellDisplay(cell.cell, 'fx', hexValue);
-            }
+            setCellValue(cell.info.step, cell.info.noteCol, cell.info.col, 'fx', hexValue);
+            updateCellDisplay(cell.cell, 'fx', hexValue);
         }
     }
 
@@ -4077,24 +6598,11 @@ function insertChordNotes(step, notes) {
         needsRebuild = true;
     }
 
-    // Ensure step data exists
-    if (!pattern.data[step]) {
-        pattern.data[step] = { columns: [] };
-    }
-    if (!pattern.data[step].columns) {
-        pattern.data[step].columns = [];
-    }
-    while (pattern.data[step].columns.length < neededColumns) {
-        pattern.data[step].columns.push({ note: '', amp: '', fx: [] });
-    }
-
-    // Insert the chord notes into each note column
-    var stepData = pattern.data[step];
     for (var i = 0; i < notes.length; i++) {
-        stepData.columns[i].note = notes[i];
-        // Don't overwrite existing amp values
-        if (!stepData.columns[i].amp) {
-            stepData.columns[i].amp = 'FF';
+        setCellValue(step, i, 0, 'note', notes[i]);
+        var info = findTrackerEventsAtStep(pattern, step, i);
+        if (info.noteEvent && (info.noteEvent.velocity === null || info.noteEvent.velocity === undefined)) {
+            setCellValue(step, i, 0, 'amp', 'FF');
         }
     }
 
@@ -4108,8 +6616,15 @@ function insertChordNotes(step, notes) {
         for (var i = 0; i < notes.length; i++) {
             var noteCell = findCellElement(step, i, 0, 'note');
             var ampCell = findCellElement(step, i, 0, 'amp');
-            if (noteCell) updateCellDisplay(noteCell, 'note', stepData.columns[i].note);
-            if (ampCell) updateCellDisplay(ampCell, 'amp', stepData.columns[i].amp);
+            if (noteCell) updateCellDisplay(noteCell, 'note', notes[i]);
+            if (ampCell) {
+                var ampVal = '';
+                var info = findTrackerEventsAtStep(pattern, step, i);
+                if (info.noteEvent && info.noteEvent.velocity !== null && info.noteEvent.velocity !== undefined) {
+                    ampVal = velocityToHex(info.noteEvent.velocity);
+                }
+                updateCellDisplay(ampCell, 'amp', ampVal);
+            }
         }
     }
 
@@ -4130,163 +6645,29 @@ function clearSelectionData() {
 
     var patternIndex = getCurrentPatternIndex();
     var pattern = getCurrentPattern();
+    if (!pattern || pattern.type === 'piano') return;
+
+    pushUndo('pattern-edit', captureStateForUndo('pattern-edit'));
 
     for (var i = 0; i < selectedCells.length; i++) {
         var cell = selectedCells[i];
         var info = getCellInfo(cell);
         if (!info) continue;
 
-        var stepData = pattern.data[info.step];
-        if (!stepData || !stepData.columns) continue;
-
-        var colData = stepData.columns[info.noteCol];
-        if (!colData) continue;
-
         if (info.type === 'note') {
-            colData.note = '';
+            setCellValue(info.step, info.noteCol, 0, 'note', '');
             updateCellDisplay(cell, 'note', '');
         } else if (info.type === 'amp') {
-            colData.amp = '';
+            setCellValue(info.step, info.noteCol, 0, 'amp', '');
             updateCellDisplay(cell, 'amp', '');
         } else if (info.type === 'fx') {
-            if (colData.fx) {
-                colData.fx[info.col] = '';
-            }
+            setCellValue(info.step, info.noteCol, info.col, 'fx', '');
             updateCellDisplay(cell, 'fx', '');
         }
     }
 
     markPatternDirty(patternIndex);
     consoleLog('Cleared ' + selectedCells.length + ' cell(s)');
-}
-
-function copySelection() {
-    if (selectedCells.length === 0) return;
-
-    var pattern = getCurrentPattern();
-
-    var minStep = Math.min(selection.startStep, selection.endStep);
-    var maxStep = Math.max(selection.startStep, selection.endStep);
-    var minNoteCol = Math.min(selection.startNoteCol || 0, selection.endNoteCol || 0);
-    var maxNoteCol = Math.max(selection.startNoteCol || 0, selection.endNoteCol || 0);
-
-    // Copy column data for selected steps
-    var data = [];
-
-    for (var step = minStep; step <= maxStep; step++) {
-        var stepData = pattern.data[step];
-        if (!stepData || !stepData.columns) continue;
-
-        var row = [];
-        for (var nc = minNoteCol; nc <= maxNoteCol; nc++) {
-            var colData = stepData.columns[nc] || { note: '', amp: '', fx: [] };
-            row.push({
-                note: colData.note,
-                amp: colData.amp,
-                fx: colData.fx ? colData.fx.slice() : []
-            });
-        }
-        data.push(row);
-    }
-
-    clipboard = {
-        type: 'columns',
-        data: data,
-        isRange: true,
-        width: maxNoteCol - minNoteCol + 1,
-        height: maxStep - minStep + 1
-    };
-
-    consoleLog('Copied ' + clipboard.height + ' steps x ' + clipboard.width + ' columns');
-}
-
-function cutSelection() {
-    copySelection();
-    clearSelectionData();
-}
-
-function pasteAtSelection() {
-    if (!clipboard.data || selectedCells.length === 0) {
-        consoleLog('Nothing to paste');
-        return;
-    }
-
-    var startCell = selectedCells[0];
-    var startInfo = getCellInfo(startCell);
-    if (!startInfo) return;
-
-    var patternIndex = getCurrentPatternIndex();
-    var pattern = getCurrentPattern();
-
-    // Handle 'columns' type clipboard (new single-track format)
-    if (clipboard.type === 'columns' && clipboard.isRange) {
-        var count = 0;
-        var needsRebuild = false;
-
-        // First pass: ensure pattern has enough note columns
-        var targetMaxCol = startInfo.noteCol + clipboard.width - 1;
-        if (targetMaxCol >= (pattern.noteColumns || 1)) {
-            while ((pattern.noteColumns || 1) <= targetMaxCol) {
-                addNoteColumn(patternIndex);
-            }
-            needsRebuild = true;
-        }
-
-        if (needsRebuild) {
-            invalidatePatternCache();
-        }
-
-        // Second pass: paste the data
-        for (var rowIdx = 0; rowIdx < clipboard.height; rowIdx++) {
-            var targetStep = startInfo.step + rowIdx;
-            if (targetStep >= pattern.steps) break;
-
-            var stepData = pattern.data[targetStep];
-            if (!stepData || !stepData.columns) continue;
-
-            for (var colIdx = 0; colIdx < clipboard.width; colIdx++) {
-                var targetNoteCol = startInfo.noteCol + colIdx;
-                if (targetNoteCol >= stepData.columns.length) continue;
-
-                var cellData = clipboard.data[rowIdx][colIdx];
-                var colData = stepData.columns[targetNoteCol];
-
-                colData.note = cellData.note;
-                colData.amp = cellData.amp;
-                if (cellData.fx) {
-                    colData.fx = cellData.fx.slice();
-                }
-
-                count++;
-            }
-        }
-
-        renderTrackerGrid(true);
-        consoleLog('Pasted ' + count + ' cells');
-        markPatternDirty(patternIndex);
-        return;
-    }
-
-    // Single cell paste
-    if (!clipboard.isRange) {
-        var stepData = pattern.data[startInfo.step];
-        if (!stepData || !stepData.columns) return;
-
-        var colData = stepData.columns[startInfo.noteCol];
-        if (!colData) return;
-
-        if (clipboard.type === 'note') {
-            colData.note = clipboard.data.note;
-            colData.amp = clipboard.data.amp;
-        } else if (clipboard.type === 'fx') {
-            if (!colData.fx) colData.fx = [];
-            colData.fx[startInfo.col] = clipboard.data;
-        }
-
-        renderTrackerGrid(true);
-        consoleLog('Pasted');
-        markPatternDirty(patternIndex);
-    }
 }
 
 // ============================================
@@ -4341,10 +6722,109 @@ function toggleRecording() {
         btn.classList.add('recording');
         consoleLog('Recording ON (Oct: ' + state.baseOctave + ')');
         setStatus('RECORDING - Octave: ' + state.baseOctave);
+
+        // Start non-playback preview timer (updates at ~60fps for smooth 1/16th visualization)
+        if (!state.isPlaying) {
+            startRecordingPreviewTimer();
+        }
     } else {
         btn.classList.remove('recording');
         consoleLog('Recording OFF');
         setStatus('Recording stopped');
+
+        // Stop preview timer and reset preview
+        stopRecordingPreviewTimer();
+        recordingPreviewBeats = 0;
+        lastRecordingPreviewBeats = 0;
+        renderTimeline();
+    }
+}
+
+// Timer for live preview during non-playback recording
+function startRecordingPreviewTimer() {
+    stopRecordingPreviewTimer();  // Clear any existing timer
+    recordingPreviewTimer = setInterval(function() {
+        if (!state.isRecording) {
+            stopRecordingPreviewTimer();
+            return;
+        }
+        // If playback started, the visualUpdateLoop handles it
+        if (state.isPlaying) {
+            return;
+        }
+        updateRecordingPreviewNonPlayback();
+    }, 16);  // ~60fps for smooth updates
+}
+
+function stopRecordingPreviewTimer() {
+    if (recordingPreviewTimer) {
+        clearInterval(recordingPreviewTimer);
+        recordingPreviewTimer = null;
+    }
+}
+
+// Update preview when recording without playback (stationary recording)
+function updateRecordingPreviewNonPlayback() {
+    var pattern = getCurrentPattern();
+    if (!pattern || pattern.type !== 'piano') {
+        recordingPreviewBeats = 0;
+        return;
+    }
+
+    var clip = getSelectedClip();
+    if (!clip) {
+        recordingPreviewBeats = 0;
+        return;
+    }
+
+    // Check if any notes are currently being held
+    var heldNotes = Object.keys(midiNoteStartBeats);
+    if (heldNotes.length === 0) {
+        if (recordingPreviewBeats !== 0) {
+            recordingPreviewBeats = 0;
+            renderTimeline();
+        }
+        return;
+    }
+
+    // Calculate expected end beat for each held note based on elapsed time
+    var baseBeats = getClipLoopLength(clip, pattern) || (pattern.beats || 0);
+    var maxEndBeat = baseBeats;
+    var quantizeBeats = pianoRoll.quantize || 0.25;
+
+    for (var i = 0; i < heldNotes.length; i++) {
+        var noteInfo = midiNoteStartBeats[heldNotes[i]];
+        if (noteInfo && noteInfo.startTime) {
+            // Calculate duration from elapsed time
+            var elapsedMs = performance.now() - noteInfo.startTime;
+            var elapsedBeats = (elapsedMs / 1000) * (state.bpm / 60);
+            var endBeat = noteInfo.beat + Math.max(quantizeBeats, Math.ceil(elapsedBeats / quantizeBeats) * quantizeBeats);
+
+            if (endBeat > maxEndBeat) {
+                maxEndBeat = endBeat;
+            }
+        }
+    }
+
+    // Set preview to rounded-up value (nearest 4 beats)
+    var newPreview = 0;
+    if (maxEndBeat > baseBeats) {
+        newPreview = Math.ceil(maxEndBeat / 4) * 4;
+    }
+
+    // Re-render timeline if preview changed at 1/16th note resolution
+    var quantizedPreview = Math.floor(newPreview * 4) / 4;
+    var quantizedLast = Math.floor(lastRecordingPreviewBeats * 4) / 4;
+
+    if (quantizedPreview !== quantizedLast) {
+        recordingPreviewBeats = newPreview;
+        lastRecordingPreviewBeats = newPreview;
+    }
+
+    var didExpand = applyRecordingPreviewToClip(pattern, clip);
+    if (quantizedPreview !== quantizedLast || didExpand) {
+        renderTimeline();
+        scheduleRenderPianoRoll();
     }
 }
 
@@ -4355,20 +6835,8 @@ function recordNote(noteName) {
     var pattern = getCurrentPattern();
     var noteCol = state.focusedNoteCol || 0;
 
-    // Ensure step data exists
-    var stepData = pattern.data[state.focusedStep];
-    if (!stepData || !stepData.columns) return;
-
-    // Ensure note column exists
-    while (stepData.columns.length <= noteCol) {
-        stepData.columns.push({ note: '', amp: '', fx: [] });
-    }
-
-    var colData = stepData.columns[noteCol];
-    colData.note = noteName;
-    if (!colData.amp) {
-        colData.amp = 'FF';  // Default velocity (full volume)
-    }
+    setCellValue(state.focusedStep, noteCol, 0, 'note', noteName);
+    setCellValue(state.focusedStep, noteCol, 0, 'amp', 'FF');  // Default velocity (full volume)
 
     markPatternDirty(patternIndex);
 
@@ -4446,11 +6914,21 @@ function updatePlayhead(step) {
 function visualUpdateLoop() {
     if (!state.isPlaying) {
         pendingVisualUpdate = null;
+        // Reset recording preview when playback stops
+        recordingPreviewBeats = 0;
+        lastRecordingPreviewBeats = 0;
         return;
     }
 
+    flushPatternNoteVizDirty();
+
     // Update timeline playhead position
     updateTimelinePlayhead();
+
+    // Live expansion preview during recording
+    if (state.isRecording) {
+        updateRecordingPreview();
+    }
 
     // If a clip is selected, show the current step in that pattern
     if (state.selectedClip && state.selectedClip.trackId !== null && state.selectedClip.clipId !== null) {
@@ -4459,13 +6937,20 @@ function visualUpdateLoop() {
             for (var i = 0; i < track.clips.length; i++) {
                 if (track.clips[i].id === state.selectedClip.clipId) {
                     var clip = track.clips[i];
+                    var pattern = state.patterns[clip.patternId];
+
                     // Check if current beat is within this clip
                     if (state.currentBeat >= clip.startBeat && state.currentBeat < getClipEndBeat(clip)) {
-                        var stepInfo = beatToPatternStep(clip, state.currentBeat);
-                        if (stepInfo.step !== lastPlayedStep) {
-                            updatePlayhead(stepInfo.step);
-                            lastPlayedStep = stepInfo.step;
+                        // Update tracker grid playhead for tracker patterns
+                        if (!pattern || pattern.type !== 'piano') {
+                            var stepInfo = beatToPatternStep(clip, state.currentBeat);
+                            if (stepInfo.step !== lastPlayedStep) {
+                                updatePlayhead(stepInfo.step);
+                                lastPlayedStep = stepInfo.step;
+                            }
                         }
+
+                        // Piano roll playhead is disabled; avoid repaint here
                     }
                     break;
                 }
@@ -4474,6 +6959,73 @@ function visualUpdateLoop() {
     }
 
     pendingVisualUpdate = requestAnimationFrame(visualUpdateLoop);
+}
+
+// Calculate and update live recording preview expansion
+function updateRecordingPreview() {
+    var pattern = getCurrentPattern();
+    if (!pattern || pattern.type !== 'piano') {
+        recordingPreviewBeats = 0;
+        return;
+    }
+
+    var clip = getSelectedClip();
+    if (!clip) {
+        recordingPreviewBeats = 0;
+        return;
+    }
+
+    // Check if any notes are currently being held
+    var heldNotes = Object.keys(midiNoteStartBeats);
+    var baseBeats = getClipLoopLength(clip, pattern) || (pattern.beats || 0);
+    if (heldNotes.length === 0) {
+        // No held notes - check if playhead position would extend pattern
+        var currentRelativeBeat = getPlaybackBeatNow() - clip.startBeat;
+        var quantizeBeats = pianoRoll.quantize || 0.25;
+        var quantizedBeat = Math.ceil(currentRelativeBeat / quantizeBeats) * quantizeBeats;
+
+        if (quantizedBeat > baseBeats) {
+            recordingPreviewBeats = Math.ceil(quantizedBeat / 4) * 4;  // Round up to 4 beats
+        } else {
+            recordingPreviewBeats = 0;
+        }
+    } else {
+        // Calculate expected end beat for each held note
+        var maxEndBeat = baseBeats;
+        var quantizeBeats = pianoRoll.quantize || 0.25;
+        var currentRelativeBeat = getPlaybackBeatNow() - clip.startBeat;
+
+        for (var i = 0; i < heldNotes.length; i++) {
+            var noteInfo = midiNoteStartBeats[heldNotes[i]];
+            if (noteInfo) {
+                // Calculate where this note would end if released now
+                var endBeat = Math.ceil(currentRelativeBeat / quantizeBeats) * quantizeBeats;
+                // Ensure minimum duration of 1/16 note
+                endBeat = Math.max(endBeat, noteInfo.beat + quantizeBeats);
+                if (endBeat > maxEndBeat) {
+                    maxEndBeat = endBeat;
+                }
+            }
+        }
+
+        // Set preview to rounded-up value (nearest 4 beats for clean display)
+        if (maxEndBeat > baseBeats) {
+            recordingPreviewBeats = Math.ceil(maxEndBeat / 4) * 4;
+        } else {
+            recordingPreviewBeats = 0;
+        }
+    }
+
+    // Re-render timeline if preview changed at 1/16th note resolution
+    var quantizedPreview = Math.floor(recordingPreviewBeats * 4) / 4;
+    var quantizedLast = Math.floor(lastRecordingPreviewBeats * 4) / 4;
+
+    var didExpand = applyRecordingPreviewToClip(pattern, clip);
+    if (quantizedPreview !== quantizedLast || didExpand) {
+        lastRecordingPreviewBeats = recordingPreviewBeats;
+        renderTimeline();
+        scheduleRenderPianoRoll();
+    }
 }
 
 // Legacy sequence-based functions removed - using clip-based playback only
@@ -4520,28 +7072,37 @@ function scheduleClipsAtBeat(beat, scheduledTime) {
         // Update tracking
         clipLastStep[clipKey] = { step: step, loopCount: loopCount };
 
-        // Get step data from pattern
-        var stepData = pattern.data ? pattern.data[step] : null;
-        if (!stepData || !stepData.columns) continue;
+        var stepBeat = step / patternLpb;
+        var events = pattern.notes || [];
+        var stepEvents = {};
+
+        for (var e = 0; e < events.length; e++) {
+            var ev = events[e];
+            if (!ev) continue;
+            if (!beatsMatch(ev.startBeat, stepBeat)) continue;
+            var col = ev.column || 0;
+            if (!stepEvents[col]) stepEvents[col] = { note: null, cell: null };
+            if (isNoteEvent(ev)) stepEvents[col].note = ev;
+            else if (isCellEvent(ev)) stepEvents[col].cell = ev;
+        }
 
         var stepDuration = 60 / (state.bpm * patternLpb);
         // Use pattern's instrument setting (1-128), not track ID
         var instrNum = pattern.instrument || 1;
 
-        // Process each note column
-        for (var nc = 0; nc < stepData.columns.length; nc++) {
-            var colData = stepData.columns[nc];
-            if (!colData) continue;
+        for (var colKey in stepEvents) {
+            var nc = parseInt(colKey);
+            var entry = stepEvents[colKey];
+            var noteEvent = entry.note;
+            var cellEvent = entry.cell;
 
             // Voice key is per-track per-noteCol (persists across clips on same track)
             var voiceKey = trackId + '_' + nc;
 
-            // Handle NOTE_OFF - turn off the active voice in this column
-            if (colData.note === NOTE_OFF) {
+            var hasOff = cellEvent && cellEvent.note === NOTE_OFF;
+            if (hasOff) {
                 if (activeVoices[voiceKey]) {
                     var voice = activeVoices[voiceKey];
-                    // Use instrument 998 (note killer) with turnoff2 for reliable note-off
-                    // p4 = fractional instrument number to turn off
                     var offMsg = 'i 998 ' + p2.toFixed(4) + ' 0.01 ' + voice.instrInstance;
                     try {
                         csound.inputMessage(offMsg);
@@ -4553,80 +7114,74 @@ function scheduleClipsAtBeat(beat, scheduledTime) {
                 } else {
                     logVoice('OFF-SKIP', voiceKey, { reason: 'no active voice' });
                 }
-                continue;
             }
 
-            // Handle new note
-            var freq = parseNote(colData.note);
-            if (freq !== null) {
-                // Check if there's already a voice in this column that needs to be turned off
-                var hadOldVoice = false;
-                if (activeVoices[voiceKey]) {
-                    hadOldVoice = true;
-                    var oldVoice = activeVoices[voiceKey];
-                    // Use instrument 998 (note killer) with turnoff2 for reliable note-off
-                    var offMsg = 'i 998 ' + p2.toFixed(4) + ' 0.01 ' + oldVoice.instrInstance;
+            if (noteEvent) {
+                var freq = midiNoteToFreq(noteEvent.pitch);
+                if (!isNaN(freq)) {
+                    // Check if there's already a voice in this column that needs to be turned off
+                    var hadOldVoice = false;
+                    if (activeVoices[voiceKey]) {
+                        hadOldVoice = true;
+                        var oldVoice = activeVoices[voiceKey];
+                        var offMsg = 'i 998 ' + p2.toFixed(4) + ' 0.01 ' + oldVoice.instrInstance;
+                        try {
+                            csound.inputMessage(offMsg);
+                            logVoice('OFF-REPLACE', voiceKey, { oldInstr: oldVoice.instrInstance, oldNote: oldVoice.noteName, msg: offMsg });
+                        } catch (err) {
+                            logVoice('OFF-REPLACE-ERROR', voiceKey, { error: err.message || err });
+                        }
+                        delete activeVoices[voiceKey];
+                    }
+
+                    // Allocate new unique fractional instance
+                    var instrInstance = instrNum + '.' + voiceCounter.toString().padStart(3, '0');
+                    voiceCounter++;
+                    if (voiceCounter > 999) voiceCounter = 1;
+
+                    var amp = (noteEvent.velocity === null || noteEvent.velocity === undefined) ? 0.5 : noteEvent.velocity;
+                    var noteOnP2 = hadOldVoice ? (p2 + 0.005).toFixed(4) : p2.toFixed(4);
+                    var pfields = [instrInstance, noteOnP2, -1, freq.toFixed(4), amp.toFixed(4)];
+
+                    // Add FX columns as p6, p7, etc.
+                    var fxCount = (noteEvent.fx || []).length;
+                    for (var fx = 0; fx < fxCount; fx++) {
+                        var fxStr = noteEvent.fx[fx];
+                        var fxVal = 0;
+                        if (fxStr && fxStr !== '' && fxStr !== '--' && fxStr !== '----') {
+                            fxVal = parseInt(fxStr, 16);
+                            if (isNaN(fxVal)) fxVal = 0;
+                        }
+                        pfields.push(fxVal);
+                    }
+
+                    var onMsg = 'i ' + pfields.join(' ');
                     try {
-                        csound.inputMessage(offMsg);
-                        logVoice('OFF-REPLACE', voiceKey, { oldInstr: oldVoice.instrInstance, oldNote: oldVoice.noteName, msg: offMsg });
+                        csound.inputMessage(onMsg);
+                        logVoice('ON', voiceKey, { instr: instrInstance, note: midiToNoteName(noteEvent.pitch), freq: freq.toFixed(2), msg: onMsg });
                     } catch (err) {
-                        logVoice('OFF-REPLACE-ERROR', voiceKey, { error: err.message || err });
+                        logVoice('ON-ERROR', voiceKey, { error: err.message || err });
                     }
-                    // Explicitly delete old voice before creating new one
-                    delete activeVoices[voiceKey];
+
+                    // Track this voice for note-off and FX updates
+                    activeVoices[voiceKey] = {
+                        instrInstance: instrInstance,
+                        instrNum: instrNum,
+                        freq: freq,
+                        amp: amp,
+                        fxCount: fxCount,
+                        noteName: midiToNoteName(noteEvent.pitch)
+                    };
                 }
-
-                // Allocate new unique fractional instance
-                var instrInstance = instrNum + '.' + voiceCounter.toString().padStart(3, '0');
-                voiceCounter++;
-                if (voiceCounter > 999) voiceCounter = 1;
-
-                var amp = parseAmplitude(colData.amp);
-                // Use -1 duration for held notes (will be turned off by NOTE_OFF or new note)
-                // Add offset (0.005s = 5ms) to ensure turn-off fully processes before note-on when replacing
-                var noteOnP2 = hadOldVoice ? (p2 + 0.005).toFixed(4) : p2.toFixed(4);
-                var pfields = [instrInstance, noteOnP2, -1, freq.toFixed(4), amp.toFixed(4)];
-
-                // Add FX columns as p6, p7, etc.
-                var fxCount = (colData.fx || []).length;
-                for (var fx = 0; fx < fxCount; fx++) {
-                    var fxStr = colData.fx[fx];
-                    var fxVal = 0;
-                    if (fxStr && fxStr !== '' && fxStr !== '--' && fxStr !== '----') {
-                        fxVal = parseInt(fxStr, 16);
-                        if (isNaN(fxVal)) fxVal = 0;
-                    }
-                    pfields.push(fxVal);
-                }
-
-                var onMsg = 'i ' + pfields.join(' ');
-                try {
-                    csound.inputMessage(onMsg);
-                    logVoice('ON', voiceKey, { instr: instrInstance, note: colData.note, freq: freq.toFixed(2), msg: onMsg });
-                } catch (err) {
-                    logVoice('ON-ERROR', voiceKey, { error: err.message || err });
-                }
-
-                // Track this voice for note-off and FX updates
-                activeVoices[voiceKey] = {
-                    instrInstance: instrInstance,
-                    instrNum: instrNum,
-                    freq: freq,
-                    amp: amp,
-                    fxCount: fxCount,
-                    noteName: colData.note
-                };
-            }
-            // No note or empty note - check for FX update on active voice
-            else if ((!colData.note || colData.note === '') && activeVoices[voiceKey]) {
-                // Check if there are any FX values to send
+            } else if (cellEvent && hasFxValues(cellEvent.fx) && activeVoices[voiceKey]) {
+                // FX update on held note
                 var hasFx = false;
                 var fxValues = [];
                 var voice = activeVoices[voiceKey];
-                var fxCount = Math.max((colData.fx || []).length, voice.fxCount || 0);
+                var fxCount = Math.max((cellEvent.fx || []).length, voice.fxCount || 0);
 
                 for (var fx = 0; fx < fxCount; fx++) {
-                    var fxStr = colData.fx && colData.fx[fx] ? colData.fx[fx] : '';
+                    var fxStr = cellEvent.fx && cellEvent.fx[fx] ? cellEvent.fx[fx] : '';
                     var fxVal = 0;
                     if (fxStr && fxStr !== '' && fxStr !== '--' && fxStr !== '----') {
                         fxVal = parseInt(fxStr, 16);
@@ -4636,9 +7191,7 @@ function scheduleClipsAtBeat(beat, scheduledTime) {
                     fxValues.push(fxVal);
                 }
 
-                // Send FX update if there are any non-zero FX values
                 if (hasFx) {
-                    // p3 = -1 means update parameters for held note
                     var pfields = [voice.instrInstance, p2.toFixed(4), -1, voice.freq.toFixed(4), voice.amp.toFixed(4)];
                     for (var fx = 0; fx < fxValues.length; fx++) {
                         pfields.push(fxValues[fx]);
@@ -4666,15 +7219,33 @@ function schedulePianoNotesAtBeat(trackId, clip, pattern, beat, p2) {
     var localBeat = beat - clip.startBeat;
     var patternBeats = pattern.beats || 4;
 
-    // Handle looping
-    var loopCount = Math.floor(localBeat / patternBeats);
-    localBeat = localBeat % patternBeats;
-    if (localBeat < 0) localBeat += patternBeats;
+    if (localBeat < 0) return;
+
+    var loopCount = 0;
+    var playBeat = localBeat;
+
+    if (clip.loopLength !== undefined && clip.loopLength !== null) {
+        var loopLength = clip.loopLength;
+        if (loopLength <= 0) return;
+
+        loopCount = Math.floor(localBeat / loopLength);
+        var loopBeat = localBeat % loopLength;
+        playBeat = (clip.offset || 0) + loopBeat;
+        if (playBeat >= patternBeats) playBeat -= patternBeats;
+    } else {
+        // Legacy offset behavior
+        playBeat = localBeat + (clip.offset || 0);
+        loopCount = Math.floor(playBeat / patternBeats);
+        playBeat = playBeat % patternBeats;
+        if (playBeat < 0) playBeat += patternBeats;
+    }
 
     // Scheduler step size (in beats) - use max LPB for finest resolution
     var maxLpb = getMaxLpb() || state.lpb;
     var schedulerStepBeats = 1 / maxLpb;
-    var tolerance = schedulerStepBeats / 2;
+    var windowStart = playBeat - schedulerStepBeats;
+    var eps = schedulerStepBeats * 0.001;
+    var hasWrapWindow = windowStart < 0;
 
     // Get instrument number for this pattern
     var instrNum = pattern.instrument || 1;
@@ -4682,18 +7253,30 @@ function schedulePianoNotesAtBeat(trackId, clip, pattern, beat, p2) {
     // Find notes that start at this beat
     for (var i = 0; i < pattern.notes.length; i++) {
         var note = pattern.notes[i];
+        if (!isNoteEvent(note)) continue;
 
-        // Check if this note should start now (within tolerance)
-        if (Math.abs(note.startBeat - localBeat) < tolerance) {
+        var startBeat = note.startBeat;
+        // Check if this note start is within the current scheduler window
+        var inWindow = false;
+        if (!hasWrapWindow) {
+            inWindow = (startBeat > windowStart + eps && startBeat <= playBeat + eps);
+        } else {
+            var wrapStart = windowStart + patternBeats;
+            inWindow = (startBeat > wrapStart + eps && startBeat <= patternBeats + eps) ||
+                       (startBeat <= playBeat + eps);
+        }
+
+        if (inWindow) {
             var voiceKey = trackId + '_piano_' + i + '_' + loopCount;
 
             // Skip if already played in this loop
             if (activePianoVoices[voiceKey]) continue;
 
             // Calculate duration in seconds
+            if (typeof note.duration !== 'number' || note.duration <= 0) continue;
             var durationSecs = (note.duration * 60) / state.bpm;
             var freq = midiNoteToFreq(note.pitch);
-            var amp = note.velocity || 0.5;
+            var amp = (note.velocity === null || note.velocity === undefined) ? 0.5 : note.velocity;
 
             // Create unique instrument instance (string format to avoid float precision issues)
             voiceCounter++;
@@ -4702,6 +7285,17 @@ function schedulePianoNotesAtBeat(trackId, clip, pattern, beat, p2) {
 
             // Schedule note-on
             var pfields = [instrInstance, p2.toFixed(4), durationSecs.toFixed(4), freq.toFixed(4), amp.toFixed(4)];
+            var fxValues = note.fx || [];
+            var fxCount = Math.min(8, fxValues.length);
+            for (var fx = 0; fx < fxCount; fx++) {
+                var fxVal = fxValues[fx];
+                if (typeof fxVal === 'string' && fxVal !== '' && fxVal !== '--' && fxVal !== '----') {
+                    var parsed = parseInt(fxVal, 16);
+                    fxVal = isNaN(parsed) ? 0 : parsed;
+                }
+                if (typeof fxVal !== 'number' || !isFinite(fxVal)) fxVal = 0;
+                pfields.push(fxVal);
+            }
             var msg = 'i ' + pfields.join(' ');
 
             try {
@@ -4735,18 +7329,23 @@ function midiNoteToFreq(midiNote) {
 
 // Get note duration in steps for a specific note column
 function getNoteDurationStepsSingle(pattern, startStep, noteColIndex) {
-    // Find the next note or note-off to determine duration
-    for (var step = startStep + 1; step < pattern.steps; step++) {
-        var stepData = pattern.data[step];
-        if (stepData && stepData.columns && stepData.columns[noteColIndex]) {
-            var colData = stepData.columns[noteColIndex];
-            if (colData.note && colData.note !== '') {
-                return step - startStep;
-            }
+    var lpb = pattern.lpb || state.lpb;
+    var startBeat = startStep / lpb;
+    var endBeat = pattern.steps / lpb;
+    var events = pattern.notes || [];
+
+    for (var i = 0; i < events.length; i++) {
+        var ev = events[i];
+        if ((ev.column || 0) !== noteColIndex) continue;
+        if (ev.startBeat <= startBeat) continue;
+        if (isNoteEvent(ev) || (isCellEvent(ev) && ev.note === NOTE_OFF)) {
+            if (ev.startBeat < endBeat) endBeat = ev.startBeat;
         }
     }
-    // No next note found, play until pattern end
-    return -1;
+
+    var durationBeats = endBeat - startBeat;
+    if (durationBeats <= 0) durationBeats = 1 / lpb;
+    return Math.max(1, Math.round(durationBeats * lpb));
 }
 
 // Get the maximum LPB from all patterns (for scheduling resolution)
@@ -4757,6 +7356,26 @@ function getMaxLpb() {
         if (patternLpb > maxLpb) maxLpb = patternLpb;
     }
     return maxLpb;
+}
+
+function getPlaybackBeatNow() {
+    if (!state.isPlaying || !audioCtx) return state.currentBeat;
+
+    var elapsedSecs = audioCtx.currentTime - playbackStartTime;
+    var elapsedBeats = elapsedSecs * (state.bpm / 60);
+    var beat = playbackStartBeat + elapsedBeats;
+
+    if (state.timeline.loopEnabled) {
+        var loopStart = state.timeline.loopStart || 0;
+        var loopLen = (state.timeline.loopEnd || 0) - loopStart;
+        if (loopLen > 0) {
+            var rel = beat - loopStart;
+            rel = ((rel % loopLen) + loopLen) % loopLen;
+            beat = loopStart + rel;
+        }
+    }
+
+    return beat;
 }
 
 // Lookahead scheduler - uses Web Audio clock for sample-accurate timing
@@ -4774,7 +7393,7 @@ function scheduler() {
         scheduleClipsAtBeat(state.currentBeat, nextStepTime);
         state.currentBeat += 1 / schedulerLpb;  // Advance by finest step unit
 
-        // Check loop region or wrap at timeline end
+        // Check loop region or stop at song end
         if (state.timeline.loopEnabled) {
             // Loop within the loop region
             if (state.currentBeat >= state.timeline.loopEnd) {
@@ -4783,19 +7402,16 @@ function scheduler() {
                 state.currentBeat = state.timeline.loopStart;
                 clipLastStep = {};  // Reset clip tracking for loop
                 activeVoices = {};  // Reset active voices for loop
+                activePianoVoices = {};  // Reset piano roll voices for loop
                 voiceCounter = 1;
             }
         } else {
-            // Wrap around at timeline end (or arrangement end)
-            var arrangementEnd = getMaxClipEndBeat();
-            var wrapPoint = arrangementEnd > 0 ? snapToMeasureEnd(arrangementEnd) : state.timeline.totalBeats;
-            if (state.currentBeat >= wrapPoint) {
-                // Turn off all held notes before wrapping
-                turnOffAllActiveVoices(nextStepTime - audioCtx.currentTime);
-                state.currentBeat = 0;
-                clipLastStep = {};  // Reset clip tracking
-                activeVoices = {};  // Reset active voices
-                voiceCounter = 1;
+            // Stop at the song end marker when looping is disabled
+            var endPoint = state.timeline.totalBeats;
+            if (state.currentBeat >= endPoint) {
+                state.currentBeat = endPoint;
+                stopPlayback();
+                return;
             }
         }
         nextStepTime += stepDuration;
@@ -4814,11 +7430,16 @@ function startPlayback() {
         return;
     }
 
-    state.isPlaying = true;
-    // Use current playhead position if set, otherwise loop start or 0
-    if (state.currentBeat <= 0) {
+    // If the playhead is at/after the end, restart from loop start or 0
+    var playbackEnd = state.timeline.loopEnabled ? state.timeline.loopEnd : state.timeline.totalBeats;
+    if (state.currentBeat >= playbackEnd - 0.0001) {
         state.currentBeat = state.timeline.loopEnabled ? state.timeline.loopStart : 0;
     }
+    if (state.currentBeat < 0) {
+        state.currentBeat = state.timeline.loopEnabled ? state.timeline.loopStart : 0;
+    }
+
+    state.isPlaying = true;
     clipLastStep = {};  // Reset clip step tracking
     activeVoices = {};  // Reset active voices
     voiceCounter = 1;  // Reset voice counter
@@ -4831,6 +7452,7 @@ function startPlayback() {
     prerenderAllPatterns();
 
     // Initialize precise timing using Web Audio clock
+    playbackStartBeat = state.currentBeat;
     playbackStartTime = audioCtx.currentTime;
     nextStepTime = audioCtx.currentTime;
     // Start lookahead scheduler (runs every 25ms, schedules 100ms ahead)
@@ -4838,6 +7460,9 @@ function startPlayback() {
 
     // Visual updates are decoupled from audio - use requestAnimationFrame
     pendingVisualUpdate = requestAnimationFrame(visualUpdateLoop);
+
+    // Stop non-playback preview timer (visualUpdateLoop handles it during playback)
+    stopRecordingPreviewTimer();
 
     document.getElementById('btn-play').disabled = true;
     document.getElementById('btn-stop').disabled = false;
@@ -4855,10 +7480,16 @@ function killAllNotes() {
 }
 
 function stopPlayback() {
-    // If already stopped, second click kills all notes (panic)
+    // If already stopped, second click goes back to beginning
     if (!state.isPlaying) {
+        state.currentBeat = 0;
+        var playhead = document.getElementById('timeline-playhead');
+        if (playhead) {
+            playhead.style.left = '0px';
+        }
+        updateTimelinePlayhead();
         killAllNotes();
-        consoleLog('All notes off');
+        consoleLog('Returned to start');
         return;
     }
 
@@ -4894,6 +7525,15 @@ function stopPlayback() {
 
     // Clear MIDI recording state
     midiNoteStartBeats = {};
+
+    // Reset recording preview
+    recordingPreviewBeats = 0;
+    lastRecordingPreviewBeats = 0;
+
+    // Restart preview timer if still recording (for non-playback recording mode)
+    if (state.isRecording) {
+        startRecordingPreviewTimer();
+    }
 
     var rows = document.querySelectorAll('.track-row.playing');
     for (var i = 0; i < rows.length; i++) {
@@ -4963,6 +7603,7 @@ function saveSong() {
         timeSignature: state.timeSignature,
         quantize: state.quantize,
         patterns: state.patterns.map(function(p) {
+            if (p && p.type !== 'piano') syncNotesToData(p);
             return {
                 id: p.id,
                 name: p.name,
@@ -4971,7 +7612,10 @@ function saveSong() {
                 instrument: p.instrument || 1,
                 steps: p.steps,
                 lpb: p.lpb,
+                beats: p.beats,
                 noteColumns: p.noteColumns,
+                fxColumns: p.fxColumns,
+                notes: p.notes,
                 data: p.data
             };
         }),
@@ -4989,6 +7633,7 @@ function saveSong() {
         }),
         instruments: state.instruments,
         opcodes: state.opcodes,
+        songInfo: state.songInfo,
         timeline: state.timeline,
         ftablePool: serializedFtables,
         usedFtables: state.usedFtables,
@@ -5010,6 +7655,474 @@ function saveSong() {
     consoleLog('Song saved (v6 format, ' + sizeKB + 'KB, ' + serializedFtables.length + ' ftables)');
 }
 
+function saveSongAs(name) {
+    saveCurrentInstrument();
+    saveOpcodes();
+
+    // Serialize ftable pool with base64-encoded audio data
+    var serializedFtables = state.ftablePool.map(function(item) {
+        var sample = state.samples.find(function(s) { return s.tableNum === item.tableNum; });
+        return {
+            tableNum: item.tableNum,
+            name: item.name,
+            libraryId: item.libraryId,
+            rawDataB64: sample && sample.rawData ? arrayBufferToBase64(sample.rawData) : null,
+            fileName: sample ? sample.fileName : null
+        };
+    });
+
+    var songData = {
+        version: 6,
+        bpm: state.bpm,
+        lpb: state.lpb,
+        timeSignature: state.timeSignature,
+        quantize: state.quantize,
+        patterns: state.patterns.map(function(p) {
+            if (p && p.type !== 'piano') syncNotesToData(p);
+            return {
+                id: p.id,
+                name: p.name,
+                type: p.type,
+                trackId: p.trackId,
+                instrument: p.instrument || 1,
+                steps: p.steps,
+                lpb: p.lpb,
+                beats: p.beats,
+                noteColumns: p.noteColumns,
+                fxColumns: p.fxColumns,
+                notes: p.notes,
+                data: p.data
+            };
+        }),
+        tracks: state.tracks.map(function(t) {
+            return {
+                id: t.id,
+                visible: t.visible,
+                muted: t.muted,
+                soloed: t.soloed,
+                volume: t.volume,
+                pan: t.pan,
+                name: t.name,
+                clips: t.clips
+            };
+        }),
+        instruments: state.instruments,
+        opcodes: state.opcodes,
+        songInfo: state.songInfo,
+        timeline: state.timeline,
+        ftablePool: serializedFtables,
+        usedFtables: state.usedFtables,
+        nextFtableNum: state.nextFtableNum
+    };
+
+    var json = JSON.stringify(songData);
+    var blob = new Blob([json], { type: 'application/octet-stream' });
+    var url = URL.createObjectURL(blob);
+
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = name + '.cst';
+    a.click();
+
+    URL.revokeObjectURL(url);
+
+    var sizeKB = (json.length / 1024).toFixed(1);
+    consoleLog('Song saved as "' + name + '.cst" (v6 format, ' + sizeKB + 'KB)');
+}
+
+// ============================================
+// CLIPBOARD OPERATIONS (Unified Events Format)
+// ============================================
+// All copy/paste operations use unified event format:
+// - Note events: { type:'note', pitch, startBeat, duration, velocity, column, fx }
+// - Cell events: { type:'cell', startBeat, column, note, amp, fx }
+// This allows copying between tracker and piano roll seamlessly.
+
+function cutSelection() {
+    if (uiFocus === 'timeline') {
+        cutClip();
+        return;
+    }
+
+    copySelection();
+    deleteSelection();
+}
+
+function copySelection() {
+    if (uiFocus === 'timeline') {
+        copySelectedClips();
+        return;
+    }
+
+    var pattern = getCurrentPattern();
+    if (!pattern) return;
+
+    // Clear clip clipboard when copying notes
+    clipboardClip = null;
+    clipboardClips = null;
+
+    var copiedEvents = [];
+    var lpb = pattern.lpb || state.lpb;
+
+    if (uiFocus === 'piano') {
+        if (pattern.type !== 'piano') {
+            consoleLog('Nothing to copy');
+            return;
+        }
+        // Copy selected piano roll notes
+        if (pianoSelection.selectedNotes.length > 0) {
+            var notes = pattern.notes || [];
+            pianoSelection.selectedNotes.forEach(function(idx) {
+                if (notes[idx]) {
+                    var n = JSON.parse(JSON.stringify(notes[idx]));
+                    n.type = 'note';
+                    copiedEvents.push(n);
+                }
+            });
+        } else if (pianoRoll.dragNote) {
+            var n = JSON.parse(JSON.stringify(pianoRoll.dragNote));
+            n.type = 'note';
+            copiedEvents.push(n);
+        }
+    } else if (uiFocus === 'tracker') {
+        if (pattern.type === 'piano') {
+            consoleLog('Nothing to copy');
+            return;
+        }
+        // Copy selected tracker cells - convert to unified events
+        if (selectedCells.length > 0) {
+            // Group cells by step and noteCol to find complete rows
+            var noteMap = {};  // key: "step_col" -> { note, amp, fx }
+
+            for (var i = 0; i < selectedCells.length; i++) {
+                var info = getCellInfo(selectedCells[i]);
+                if (!info) continue;
+
+                var key = info.step + '_' + info.noteCol;
+                if (!noteMap[key]) {
+                    noteMap[key] = { step: info.step, noteCol: info.noteCol, note: '', amp: '', fx: [] };
+                }
+
+                var value = selectedCells[i].textContent;
+                if (info.type === 'note') {
+                    noteMap[key].note = value;
+                } else if (info.type === 'amp') {
+                    noteMap[key].amp = value;
+                } else if (info.type === 'fx') {
+                    while (noteMap[key].fx.length <= info.col) {
+                        noteMap[key].fx.push('');
+                    }
+                    noteMap[key].fx[info.col] = value;
+                }
+            }
+
+            // Convert grouped cells to events
+            for (var key in noteMap) {
+                var cell = noteMap[key];
+                var stepBeat = cell.step / lpb;
+                var ampVal = (cell.amp && cell.amp !== '--') ? cell.amp : '';
+                var fxVals = cell.fx.slice();
+
+                if (cell.note === NOTE_OFF) {
+                    copiedEvents.push({
+                        type: 'cell',
+                        startBeat: stepBeat,
+                        column: cell.noteCol,
+                        note: NOTE_OFF,
+                        amp: ampVal,
+                        fx: fxVals
+                    });
+                    continue;
+                }
+
+                if (cell.note && cell.note !== '---') {
+                    var pitch = noteNameToMidi(cell.note);
+                    if (pitch === null) continue;
+
+                    copiedEvents.push({
+                        type: 'note',
+                        pitch: pitch,
+                        startBeat: stepBeat,
+                        duration: null,
+                        velocity: hexToVelocity(ampVal),
+                        column: cell.noteCol,
+                        fx: fxVals
+                    });
+                    continue;
+                }
+
+                if ((ampVal && ampVal !== '') || hasFxValues(fxVals)) {
+                    copiedEvents.push({
+                        type: 'cell',
+                        startBeat: stepBeat,
+                        column: cell.noteCol,
+                        note: '',
+                        amp: ampVal,
+                        fx: fxVals
+                    });
+                }
+            }
+
+            // Derive tracker note durations for cross-view paste
+            deriveTrackerNoteDurations(copiedEvents, lpb);
+        }
+    } else {
+        consoleLog('Nothing to copy');
+        return;
+    }
+
+    if (copiedEvents.length > 0) {
+        clipboard.type = 'events';
+        clipboard.data = copiedEvents;
+        consoleLog('Copied ' + copiedEvents.length + ' event(s)');
+    } else {
+        consoleLog('Nothing to copy');
+    }
+}
+
+function pasteSelection() {
+    if (uiFocus === 'timeline') {
+        if (!clipboardClip && (!clipboardClips || !clipboardClips.clips || clipboardClips.clips.length === 0)) {
+            if (clipboard.type === 'events') {
+                consoleLog('Clipboard has note data. Paste in tracker or piano roll.');
+            } else {
+                consoleLog('No clip in clipboard');
+            }
+            return;
+        }
+        var targetTrack = (state.timeline.cursorTrack !== undefined && state.timeline.cursorTrack !== null) ?
+            state.timeline.cursorTrack : (state.selectedTrack >= 0 ? state.selectedTrack : 0);
+        var targetBeat = (typeof state.timeline.cursorBeat === 'number') ? state.timeline.cursorBeat : (state.currentBeat || 0);
+        pasteClips(targetTrack, targetBeat);
+        return;
+    }
+
+    if (!clipboard.data || !clipboard.type) {
+        if (clipboardClip || (clipboardClips && clipboardClips.clips && clipboardClips.clips.length > 0)) {
+            consoleLog('Clipboard has a clip. Paste on the timeline.');
+        } else {
+            consoleLog('Nothing to paste');
+        }
+        return;
+    }
+
+    var pattern = getCurrentPattern();
+    if (!pattern) return;
+
+    // Handle unified events format (works for both tracker and piano roll)
+    if (clipboard.type === 'events') {
+        if (uiFocus === 'piano' && pattern.type !== 'piano') {
+            consoleLog('Nothing to paste');
+            return;
+        }
+        if (uiFocus === 'tracker' && pattern.type === 'piano') {
+            consoleLog('Nothing to paste');
+            return;
+        }
+
+        pushUndo(pattern.type === 'piano' ? 'piano-edit' : 'pattern-edit', captureStateForUndo('pattern-edit'));
+
+        var lpb = pattern.lpb || state.lpb;
+
+        // Find the earliest startBeat and column in clipboard
+        var minBeat = Infinity;
+        var minCol = Infinity;
+        var minStep = Infinity;
+        clipboard.data.forEach(function(ev) {
+            if (!ev) return;
+            if (ev.startBeat < minBeat) minBeat = ev.startBeat;
+            var col = ev.column || 0;
+            if (col < minCol) minCol = col;
+            var step = Math.round(ev.startBeat * lpb);
+            if (step < minStep) minStep = step;
+        });
+
+        if (pattern.type === 'piano') {
+            // Paste to piano roll (note events only)
+            if (!pattern.notes) pattern.notes = [];
+
+            var pasteOffset = (typeof pianoRoll.lastClickBeat === 'number') ? pianoRoll.lastClickBeat : 0;
+            var pastedCount = 0;
+
+            clipboard.data.forEach(function(ev) {
+                if (!isNoteEvent(ev)) return;
+                var newNote = JSON.parse(JSON.stringify(ev));
+                newNote.type = 'note';
+                newNote.startBeat = newNote.startBeat - minBeat + pasteOffset;
+                if (typeof newNote.duration !== 'number' || newNote.duration <= 0) {
+                    newNote.duration = pianoRoll.quantize || 0.25;
+                }
+                pattern.notes.push(newNote);
+                pastedCount++;
+            });
+
+            consoleLog('Pasted ' + pastedCount + ' note(s) to piano roll');
+            if (pastedCount > 0) {
+                markPatternNoteVizDirtyForPattern(pattern);
+            }
+            scheduleRenderPianoRoll();
+        } else {
+            // Paste to tracker grid
+            var startStep = state.focusedStep || 0;
+            var startCol = state.focusedNoteCol || 0;
+            var pastedCount = 0;
+
+            clipboard.data.forEach(function(ev) {
+                if (!ev) return;
+                var eventStep = Math.round(ev.startBeat * lpb);
+                var targetStep = eventStep - minStep + startStep;
+                var targetCol = (ev.column || 0) - minCol + startCol;
+
+                if (targetStep < 0 || targetStep >= pattern.steps) return;
+                if (targetCol < 0 || targetCol >= pattern.noteColumns) return;
+
+                if (isNoteEvent(ev)) {
+                    if (ev.pitch === null || ev.pitch === undefined) return;
+                    setCellValue(targetStep, targetCol, 0, 'note', midiToNoteName(ev.pitch));
+                    if (ev.velocity !== null && ev.velocity !== undefined) {
+                        setCellValue(targetStep, targetCol, 0, 'amp', velocityToHex(ev.velocity));
+                    } else {
+                        setCellValue(targetStep, targetCol, 0, 'amp', '');
+                    }
+                    if (ev.fx && ev.fx.length > 0) {
+                        for (var fx = 0; fx < ev.fx.length; fx++) {
+                            setCellValue(targetStep, targetCol, fx, 'fx', ev.fx[fx] || '');
+                        }
+                    }
+
+                    // If duration is set (e.g., from piano roll), insert NOTE_OFF
+                    if (typeof ev.duration === 'number' && ev.duration > 0) {
+                        var offStep = Math.round((ev.startBeat + ev.duration) * lpb) - minStep + startStep;
+                        if (offStep >= 0 && offStep < pattern.steps) {
+                            var offInfo = findTrackerEventsAtStep(pattern, offStep, targetCol);
+                            if (!offInfo.noteEvent) {
+                                setCellValue(offStep, targetCol, 0, 'note', NOTE_OFF);
+                            }
+                        }
+                    }
+                    pastedCount++;
+                } else if (isCellEvent(ev)) {
+                    if (ev.note === NOTE_OFF) {
+                        setCellValue(targetStep, targetCol, 0, 'note', NOTE_OFF);
+                    }
+                    if (ev.amp !== undefined) {
+                        setCellValue(targetStep, targetCol, 0, 'amp', ev.amp || '');
+                    }
+                    if (ev.fx && ev.fx.length > 0) {
+                        for (var fx = 0; fx < ev.fx.length; fx++) {
+                            setCellValue(targetStep, targetCol, fx, 'fx', ev.fx[fx] || '');
+                        }
+                    }
+                    pastedCount++;
+                }
+            });
+
+            consoleLog('Pasted ' + pastedCount + ' event(s) to tracker');
+            invalidatePatternCache();
+            renderTrackerGrid(true);
+        }
+        return;
+    }
+
+    // Legacy support for old tracker-cells format
+    if (clipboard.type === 'tracker-cells' && pattern.type !== 'piano' && uiFocus === 'tracker') {
+        pushUndo('pattern-edit', captureStateForUndo('pattern-edit'));
+
+        var startStep = state.focusedStep || 0;
+        var startNoteCol = state.focusedNoteCol || 0;
+
+        var minStep = Infinity, minNoteCol = Infinity;
+        clipboard.data.forEach(function(c) {
+            if (c.step < minStep) minStep = c.step;
+            if (c.noteCol < minNoteCol) minNoteCol = c.noteCol;
+        });
+
+        clipboard.data.forEach(function(c) {
+            var targetStep = c.step - minStep + startStep;
+            var targetNoteCol = c.noteCol - minNoteCol + startNoteCol;
+
+            if (targetStep < pattern.steps && targetNoteCol < pattern.noteColumns) {
+                if (c.type === 'note') setCellValue(targetStep, targetNoteCol, 0, 'note', c.value);
+                else if (c.type === 'amp') setCellValue(targetStep, targetNoteCol, 0, 'amp', c.value);
+                else if (c.type === 'fx') setCellValue(targetStep, targetNoteCol, c.col, 'fx', c.value);
+            }
+        });
+
+        consoleLog('Pasted ' + clipboard.data.length + ' cells');
+        invalidatePatternCache();
+        renderTrackerGrid(true);
+    }
+}
+
+function pasteAtSelection() {
+    uiFocus = 'tracker';
+    pasteSelection();
+}
+
+function deleteSelection() {
+    var pattern = getCurrentPattern();
+    if (!pattern) return;
+
+    pushUndo(pattern.type === 'piano' ? 'piano-edit' : 'pattern-edit', captureStateForUndo('pattern-edit'));
+
+    if (pattern.type === 'piano') {
+        // Delete selected piano roll notes
+        if (pianoSelection.selectedNotes.length > 0) {
+            var notes = pattern.notes || [];
+            // Sort indices descending to remove from end first
+            var sorted = pianoSelection.selectedNotes.slice().sort(function(a, b) { return b - a; });
+            sorted.forEach(function(idx) {
+                notes.splice(idx, 1);
+            });
+            pianoSelection.selectedNotes = [];
+            consoleLog('Deleted ' + sorted.length + ' notes');
+            markPatternNoteVizDirtyForPattern(pattern);
+            scheduleRenderPianoRoll();
+        } else if (pianoRoll.dragNote && pianoRoll.dragNoteIndex >= 0) {
+            var notes = pattern.notes || [];
+            notes.splice(pianoRoll.dragNoteIndex, 1);
+            pianoRoll.dragNote = null;
+            pianoRoll.dragNoteIndex = -1;
+            consoleLog('Deleted 1 note');
+            markPatternNoteVizDirtyForPattern(pattern);
+            scheduleRenderPianoRoll();
+        }
+    } else {
+        // Delete selected tracker cells
+        if (selectedCells.length > 0) {
+            for (var i = 0; i < selectedCells.length; i++) {
+                var info = getCellInfo(selectedCells[i]);
+                if (!info) continue;
+                if (info.type === 'note') setCellValue(info.step, info.noteCol, 0, 'note', '');
+                else if (info.type === 'amp') setCellValue(info.step, info.noteCol, 0, 'amp', '');
+                else if (info.type === 'fx') setCellValue(info.step, info.noteCol, info.col, 'fx', '');
+            }
+            consoleLog('Deleted ' + selectedCells.length + ' cells');
+            invalidatePatternCache();
+            renderTrackerGrid(true);
+        }
+    }
+}
+
+function selectAll() {
+    var pattern = getCurrentPattern();
+    if (!pattern) return;
+
+    if (pattern.type === 'piano') {
+        // Select all piano roll notes
+        var notes = pattern.notes || [];
+        pianoSelection.selectedNotes = [];
+        for (var i = 0; i < notes.length; i++) {
+            pianoSelection.selectedNotes.push(i);
+        }
+        consoleLog('Selected ' + notes.length + ' notes');
+        scheduleRenderPianoRoll();
+    } else {
+        // Select all tracker cells - this is handled elsewhere
+        consoleLog('Select all for tracker not implemented');
+    }
+}
+
 function loadSong(file) {
     var reader = new FileReader();
     reader.onload = function(e) {
@@ -5024,8 +8137,33 @@ function loadSong(file) {
             state.patterns = songData.patterns || [];
             state.instruments = songData.instruments || defaultInstruments.slice();
             state.opcodes = songData.opcodes || '';
+            state.songInfo = songData.songInfo || '';
             state.currentInstrument = 0;
             state.selectedClip = { trackId: null, clipId: null };
+
+            // Normalize patterns (notes/events)
+            state.patterns.forEach(function(p) {
+                if (!p) return;
+                if (!p.lpb) p.lpb = state.lpb;
+                if (!p.noteColumns) p.noteColumns = 1;
+                if (!p.fxColumns) {
+                    p.fxColumns = [];
+                    while (p.fxColumns.length < p.noteColumns) p.fxColumns.push(0);
+                }
+                if (p.type === 'tracker') {
+                    if (!p.steps) p.steps = 16;
+                    p.beats = p.steps / (p.lpb || state.lpb);
+                    if (!p.notes || p.notes.length === 0) {
+                        if (p.data) p.notes = trackerDataToNotes(p);
+                        else p.notes = [];
+                    }
+                } else if (p.type === 'piano') {
+                    if (!p.beats) {
+                        p.beats = p.steps ? (p.steps / (p.lpb || state.lpb)) : 4;
+                    }
+                    if (!p.notes) p.notes = [];
+                }
+            });
 
             // Handle track/clip migration based on version
             if (version < 5) {
@@ -5076,6 +8214,7 @@ function loadSong(file) {
                     }
                 }
                 state.timeline = songData.timeline || { zoom: 1, scrollX: 0, totalBeats: 4000 };
+                ensureTimelineDefaults();
                 consoleLog('Migrated from v' + version + ' format');
             } else {
                 // v5 format - pure DAW with clips only
@@ -5093,6 +8232,7 @@ function loadSong(file) {
                 }
                 if (state.tracks.length === 0) addTrack();
                 state.timeline = songData.timeline || { zoom: 1, scrollX: 0, totalBeats: 4000 };
+                ensureTimelineDefaults();
             }
 
             // Ensure instruments array has 128 entries
@@ -5143,6 +8283,8 @@ function loadSong(file) {
 
             initInstrumentTabs();
             document.getElementById('opcodes-editor').value = state.opcodes;
+            var infoEl = document.getElementById('song-info-text');
+            if (infoEl) infoEl.value = state.songInfo || '';
 
             invalidatePatternCache();
             prerenderAllPatterns();
@@ -5187,10 +8329,35 @@ async function loadDemo(demoNum) {
         state.timeSignature = songData.timeSignature || { num: 4, den: 4 };
         state.quantize = songData.quantize || '1/16';
         state.patterns = songData.patterns || [];
-        state.instruments = songData.instruments || defaultInstruments.slice();
-        state.opcodes = songData.opcodes || '';
+            state.instruments = songData.instruments || defaultInstruments.slice();
+            state.opcodes = songData.opcodes || '';
+            state.songInfo = songData.songInfo || '';
         state.currentInstrument = 0;
         state.selectedClip = { trackId: null, clipId: null };
+
+        // Normalize patterns (notes/events)
+        state.patterns.forEach(function(p) {
+            if (!p) return;
+            if (!p.lpb) p.lpb = state.lpb;
+            if (!p.noteColumns) p.noteColumns = 1;
+            if (!p.fxColumns) {
+                p.fxColumns = [];
+                while (p.fxColumns.length < p.noteColumns) p.fxColumns.push(0);
+            }
+            if (p.type === 'tracker') {
+                if (!p.steps) p.steps = 16;
+                p.beats = p.steps / (p.lpb || state.lpb);
+                if (!p.notes || p.notes.length === 0) {
+                    if (p.data) p.notes = trackerDataToNotes(p);
+                    else p.notes = [];
+                }
+            } else if (p.type === 'piano') {
+                if (!p.beats) {
+                    p.beats = p.steps ? (p.steps / (p.lpb || state.lpb)) : 4;
+                }
+                if (!p.notes) p.notes = [];
+            }
+        });
 
         // Handle track/clip migration based on version
         if (version < 5) {
@@ -5239,6 +8406,7 @@ async function loadDemo(demoNum) {
                 }
             }
             state.timeline = songData.timeline || { zoom: 1, scrollX: 0, totalBeats: 4000 };
+            ensureTimelineDefaults();
         } else {
             // v5 format - pure DAW
             var loadedTracks = songData.tracks || [];
@@ -5255,6 +8423,7 @@ async function loadDemo(demoNum) {
             }
             if (state.tracks.length === 0) addTrack();
             state.timeline = songData.timeline || { zoom: 1, scrollX: 0, totalBeats: 4000 };
+            ensureTimelineDefaults();
         }
 
         // Ensure instruments array has 128 entries
@@ -5299,6 +8468,8 @@ async function loadDemo(demoNum) {
 
         initInstrumentTabs();
         document.getElementById('opcodes-editor').value = state.opcodes;
+        var infoEl = document.getElementById('song-info-text');
+        if (infoEl) infoEl.value = state.songInfo || '';
 
         invalidatePatternCache();
         prerenderAllPatterns();
@@ -5330,6 +8501,27 @@ function exportCSD() {
     saveCurrentInstrument();
     saveOpcodes();
 
+    function isEmptyInstrument(code, instrIndex) {
+        if (!code) return true;
+        var trimmed = code.replace(/\r/g, '').trim();
+        if (!trimmed) return true;
+        var lines = trimmed.split('\n').map(function(line) {
+            return line.replace(/;.*/, '').trim();
+        }).filter(function(line) { return line.length > 0; });
+        if (lines.length === 0) return true;
+        var collapsed = lines.join(' ').replace(/\s+/g, ' ').trim();
+        var emptyPattern = new RegExp('^instr\\s+' + (instrIndex + 1) + '\\s*endin$', 'i');
+        return emptyPattern.test(collapsed);
+    }
+
+    var instrumentBlocks = [];
+    for (var ins = 0; ins < state.instruments.length; ins++) {
+        var instrCode = state.instruments[ins];
+        if (!isEmptyInstrument(instrCode, ins)) {
+            instrumentBlocks.push(instrCode);
+        }
+    }
+
     // Collect ftable sample files for inclusion
     var sampleFiles = [];  // { fileName, rawData }
     var ftableStatements = [];
@@ -5360,11 +8552,19 @@ function exportCSD() {
     csd += 'sr = 44100\nksmps = 32\nnchnls = 2\n0dbfs = 1\n\n';
     csd += 'gisine ftgen 1, 0, 16384, 10, 1\n\n';
 
+    if (state.songInfo && state.songInfo.trim()) {
+        csd += '; Song Info\n';
+        state.songInfo.replace(/\r/g, '').split('\n').forEach(function(line) {
+            csd += '; ' + line + '\n';
+        });
+        csd += '\n';
+    }
+
     if (state.opcodes && state.opcodes.trim()) {
         csd += '; User Defined Opcodes\n' + state.opcodes + '\n\n';
     }
 
-    csd += state.instruments.join('\n\n');
+    csd += instrumentBlocks.join('\n\n');
     csd += '\n</CsInstruments>\n<CsScore>\n';
 
     // Add ftable load statements at the top of the score
@@ -5373,7 +8573,7 @@ function exportCSD() {
         csd += ftableStatements.join('\n') + '\n\n';
     }
 
-    var events = [];
+    var scoreEvents = [];
     var csdVoiceCounter = 1;
     var csdActiveVoices = {};
 
@@ -5390,145 +8590,172 @@ function exportCSD() {
 
             var patternLpb = pattern.lpb || state.lpb;
             var stepDuration = 60 / (state.bpm * patternLpb);
-            var patternBeats = pattern.steps / patternLpb;
             var instrNum = pattern.instrument || 1;
+            var clipDuration = getClipDurationBeats(clip);
+            var clipEvents = collectClipEventsForSegment(pattern, clip, 0, clipDuration);
 
-            for (var loop = 0; loop < clip.loopCount; loop++) {
-                var loopStartBeat = clip.startBeat + (loop * patternBeats);
-                var loopStartTime = loopStartBeat * (60 / state.bpm);
+            for (var ei = 0; ei < clipEvents.length; ei++) {
+                var ev = clipEvents[ei];
+                if (!ev) continue;
+                if (pattern.type === 'piano' && !isNoteEvent(ev)) continue;
 
-                for (var step = 0; step < pattern.steps; step++) {
-                    var stepTime = loopStartTime + (step * stepDuration);
-                    var stepData = pattern.data[step];
-                    if (!stepData || !stepData.columns) continue;
+                var eventBeat = clip.startBeat + ev.startBeat;
+                var eventTime = eventBeat * (60 / state.bpm);
 
-                    for (var nc = 0; nc < stepData.columns.length; nc++) {
-                        var colData = stepData.columns[nc];
-                        if (!colData) continue;
-
-                        allClipEvents.push({
-                            time: stepTime,
-                            trackIdx: trackIdx,
-                            noteCol: nc,
-                            instrNum: instrNum,
-                            colData: colData,
-                            stepDuration: stepDuration
-                        });
-                    }
-                }
+                allClipEvents.push({
+                    time: eventTime,
+                    trackIdx: trackIdx,
+                    noteCol: ev.column || 0,
+                    instrNum: instrNum,
+                    event: ev,
+                    stepDuration: stepDuration,
+                    isPiano: pattern.type === 'piano'
+                });
             }
         }
     }
 
     allClipEvents.sort(function(a, b) { return a.time - b.time; });
 
+    function exportFxValue(val) {
+        if (typeof val === 'number' && isFinite(val)) return val;
+        if (typeof val === 'string' && val !== '' && val !== '--' && val !== '----') {
+            var parsed = parseInt(val, 16);
+            if (!isNaN(parsed)) return parsed;
+        }
+        return 0;
+    }
+
+    function nextInstrInstance(instrNum) {
+        var suffix = csdVoiceCounter.toString().padStart(3, '0');
+        csdVoiceCounter++;
+        if (csdVoiceCounter > 999) csdVoiceCounter = 1;
+        return instrNum + '.' + suffix;
+    }
+
+    function pushScoreEvent(p1, time, p3, fields) {
+        var p1Str = String(p1);
+        var p2Str = time.toFixed(4);
+        var p3Num = (typeof p3 === 'number') ? p3 : parseFloat(p3) || 0;
+        var p3Str = p3Num.toFixed(4);
+        var line = 'i ' + p1Str + ' ' + p2Str + ' ' + p3Str;
+        if (fields && fields.length > 0) {
+            line += ' ' + fields.join(' ');
+        }
+        scoreEvents.push({
+            time: time,
+            p1: parseFloat(p1Str),
+            p3: p3Num,
+            line: line
+        });
+    }
+
     for (var i = 0; i < allClipEvents.length; i++) {
         var evt = allClipEvents[i];
-        var voiceKey = evt.trackIdx + '_' + evt.noteCol;
-        var colData = evt.colData;
+        var ev = evt.event;
         var stepTime = evt.time;
         var instrNum = evt.instrNum;
 
-        if (colData.note === NOTE_OFF) {
-            if (csdActiveVoices[voiceKey]) {
-                var voice = csdActiveVoices[voiceKey];
-                var duration = stepTime - voice.start;
-                var pfields = [voice.instr, voice.start.toFixed(4), duration.toFixed(4), voice.freq.toFixed(4), voice.amp.toFixed(4)];
-                for (var fx = 0; fx < voice.fxValues.length; fx++) {
-                    pfields.push(voice.fxValues[fx]);
-                }
-                events.push('i ' + pfields.join(' '));
-                delete csdActiveVoices[voiceKey];
+        // Clean up expired voices so updates don't target ended notes
+        for (var vk in csdActiveVoices) {
+            if (csdActiveVoices[vk].endTime <= stepTime + 0.0001) {
+                delete csdActiveVoices[vk];
+            }
+        }
+
+        if (evt.isPiano && isNoteEvent(ev)) {
+            var durationBeats = (typeof ev.duration === 'number' && ev.duration > 0) ? ev.duration : (1 / (state.lpb || 4));
+            var durationSecs = (durationBeats * 60) / state.bpm;
+            var freq = midiNoteToFreq(ev.pitch);
+            var amp = (ev.velocity === null || ev.velocity === undefined) ? 0.5 : ev.velocity;
+
+            var instrInstance = nextInstrInstance(instrNum);
+            var pfields = [freq.toFixed(4), amp.toFixed(4)];
+            var fxValues = ev.fx || [];
+            for (var fx = 0; fx < fxValues.length; fx++) {
+                pfields.push(exportFxValue(fxValues[fx]));
+            }
+
+            // Start held note
+            pushScoreEvent(instrInstance, stepTime, -1, pfields);
+            // Explicit note-off using negative p1
+            pushScoreEvent('-' + instrInstance, stepTime + durationSecs, 0, []);
+            continue;
+        }
+
+        var voiceKey = evt.trackIdx + '_' + evt.noteCol;
+
+        if (isCellEvent(ev) && ev.note === NOTE_OFF) {
+            var offVoice = csdActiveVoices[voiceKey];
+            if (offVoice && offVoice.endTime > stepTime + 0.0001) {
+                pushScoreEvent('-' + offVoice.instr, stepTime, 0, []);
+                offVoice.endTime = stepTime;
             }
             continue;
         }
 
-        var freq = parseNote(colData.note);
-        if (freq !== null) {
-            if (csdActiveVoices[voiceKey]) {
-                var prevVoice = csdActiveVoices[voiceKey];
-                var prevDuration = stepTime - prevVoice.start;
-                var pfields = [prevVoice.instr, prevVoice.start.toFixed(4), prevDuration.toFixed(4), prevVoice.freq.toFixed(4), prevVoice.amp.toFixed(4)];
-                for (var fx = 0; fx < prevVoice.fxValues.length; fx++) {
-                    pfields.push(prevVoice.fxValues[fx]);
-                }
-                events.push('i ' + pfields.join(' '));
-            }
+        if (isNoteEvent(ev)) {
+            var freq = midiNoteToFreq(ev.pitch);
+            var durationBeats = (typeof ev.duration === 'number' && ev.duration > 0) ? ev.duration : (1 / (state.lpb || 4));
+            var durationSecs = (durationBeats * 60) / state.bpm;
 
-            var instrInstance = instrNum + '.' + csdVoiceCounter.toString().padStart(3, '0');
-            csdVoiceCounter++;
-            if (csdVoiceCounter > 999) csdVoiceCounter = 1;
+            var instrInstance = nextInstrInstance(instrNum);
 
-            var amp = parseAmplitude(colData.amp);
+            var amp = (ev.velocity === null || ev.velocity === undefined) ? 0.5 : ev.velocity;
             var fxValues = [];
-            for (var fx = 0; fx < (colData.fx || []).length; fx++) {
-                var fxStr = colData.fx[fx];
-                var fxVal = 0;
-                if (fxStr && fxStr !== '' && fxStr !== '--' && fxStr !== '----') {
-                    fxVal = parseInt(fxStr, 16);
-                    if (isNaN(fxVal)) fxVal = 0;
-                }
-                fxValues.push(fxVal);
+            for (var fx = 0; fx < (ev.fx || []).length; fx++) {
+                fxValues.push(exportFxValue(ev.fx[fx]));
             }
+
+            var pfields = [freq.toFixed(4), amp.toFixed(4)];
+            for (var fx = 0; fx < fxValues.length; fx++) {
+                pfields.push(fxValues[fx]);
+            }
+
+            // Start held note
+            pushScoreEvent(instrInstance, stepTime, -1, pfields);
+            // Explicit note-off using negative p1
+            pushScoreEvent('-' + instrInstance, stepTime + durationSecs, 0, []);
 
             csdActiveVoices[voiceKey] = {
-                start: stepTime,
                 instr: instrInstance,
                 freq: freq,
                 amp: amp,
-                fxValues: fxValues,
-                fxCount: fxValues.length
+                fxCount: fxValues.length,
+                endTime: stepTime + durationSecs
             };
-        }
-        else if ((!colData.note || colData.note === '') && csdActiveVoices[voiceKey]) {
-            var hasFx = false;
-            var fxValues = [];
+        } else if (isCellEvent(ev) && hasFxValues(ev.fx) && csdActiveVoices[voiceKey]) {
             var voice = csdActiveVoices[voiceKey];
-            var fxCount = Math.max((colData.fx || []).length, voice.fxCount || 0);
+            if (voice.endTime <= stepTime + 0.0001) continue;
+
+            var fxValues = [];
+            var fxCount = Math.max((ev.fx || []).length, voice.fxCount || 0);
+            var hasFx = false;
 
             for (var fx = 0; fx < fxCount; fx++) {
-                var fxStr = colData.fx && colData.fx[fx] ? colData.fx[fx] : '';
-                var fxVal = 0;
-                if (fxStr && fxStr !== '' && fxStr !== '--' && fxStr !== '----') {
-                    fxVal = parseInt(fxStr, 16);
-                    if (isNaN(fxVal)) fxVal = 0;
-                    hasFx = true;
-                }
-                fxValues.push(fxVal);
+                var fxStr = ev.fx && ev.fx[fx] ? ev.fx[fx] : '';
+                if (fxStr !== '' && fxStr !== '--' && fxStr !== '----') hasFx = true;
+                fxValues.push(exportFxValue(fxStr));
             }
 
             if (hasFx) {
-                var pfields = [voice.instr, stepTime.toFixed(4), -1, voice.freq.toFixed(4), voice.amp.toFixed(4)];
-                for (var fx = 0; fx < fxValues.length; fx++) {
-                    pfields.push(fxValues[fx]);
+                var updateFields = [voice.freq.toFixed(4), voice.amp.toFixed(4)];
+                for (var u = 0; u < fxValues.length; u++) {
+                    updateFields.push(fxValues[u]);
                 }
-                events.push('i ' + pfields.join(' '));
+                pushScoreEvent(voice.instr, stepTime, -1, updateFields);
+                voice.fxCount = Math.max(voice.fxCount || 0, fxValues.length);
             }
         }
     }
 
-    // Finalize all remaining voices
-    var totalDuration = state.timeline.totalBeats * (60 / state.bpm);
-    for (var voiceKey in csdActiveVoices) {
-        var voice = csdActiveVoices[voiceKey];
-        var duration = totalDuration - voice.start;
-        var defaultStepDuration = 60 / (state.bpm * state.lpb);
-        if (duration < defaultStepDuration) duration = defaultStepDuration;
-
-        var pfields = [voice.instr, voice.start.toFixed(4), duration.toFixed(4), voice.freq.toFixed(4), voice.amp.toFixed(4)];
-        for (var fx = 0; fx < voice.fxValues.length; fx++) {
-            pfields.push(voice.fxValues[fx]);
-        }
-        events.push('i ' + pfields.join(' '));
-    }
-
-    events.sort(function(a, b) {
-        var timeA = parseFloat(a.split(' ')[2]);
-        var timeB = parseFloat(b.split(' ')[2]);
-        return timeA - timeB;
+    scoreEvents.sort(function(a, b) {
+        if (a.time !== b.time) return a.time - b.time;
+        if (a.p1 !== b.p1) return a.p1 - b.p1;
+        return a.p3 - b.p3;
     });
 
-    csd += events.join('\n');
+    csd += scoreEvents.map(function(ev) { return ev.line; }).join('\n');
     csd += '\ne\n</CsScore>\n</CsoundSynthesizer>\n';
 
     // If there are ftable samples, export as ZIP with samples/ folder
@@ -5555,7 +8782,7 @@ function exportCSD() {
         URL.revokeObjectURL(url);
 
         var totalSize = (zipBlob.size / 1024).toFixed(1);
-        consoleLog('CSD exported as ZIP (' + events.length + ' events, ' + sampleFiles.length + ' samples, ' + totalSize + 'KB)');
+        consoleLog('CSD exported as ZIP (' + scoreEvents.length + ' events, ' + sampleFiles.length + ' samples, ' + totalSize + 'KB)');
     } else {
         // No samples - just export plain CSD
         var blob = new Blob([csd], { type: 'text/plain' });
@@ -5565,7 +8792,7 @@ function exportCSD() {
         a.download = 'composition.csd';
         a.click();
         URL.revokeObjectURL(url);
-        consoleLog('CSD exported (' + events.length + ' events)');
+        consoleLog('CSD exported (' + scoreEvents.length + ' events)');
     }
 }
 
@@ -5696,9 +8923,19 @@ function crc32(data) {
 
 function initMainTabs() {
     var mainTabs = document.querySelectorAll('.main-tab');
+    var activeTab = document.querySelector('.main-tab.active');
+    var currentTabName = activeTab ? activeTab.getAttribute('data-tab') : 'instruments';
     mainTabs.forEach(function(tab) {
         tab.addEventListener('click', function() {
             var tabName = this.getAttribute('data-tab');
+            if (tabName === currentTabName) return;
+
+            if (currentTabName === 'opcodes') {
+                saveOpcodes();
+                compileOpcodesIfChanged();
+            } else if (currentTabName === 'instruments') {
+                saveCurrentInstrument();
+            }
 
             mainTabs.forEach(function(t) { t.classList.remove('active'); });
             this.classList.add('active');
@@ -5707,6 +8944,8 @@ function initMainTabs() {
                 content.classList.add('hidden');
             });
             document.getElementById('tab-' + tabName).classList.remove('hidden');
+
+            currentTabName = tabName;
         });
     });
 }
@@ -5801,6 +9040,17 @@ function saveCurrentInstrument() {
 
 function saveOpcodes() {
     state.opcodes = document.getElementById('opcodes-editor').value;
+}
+
+function compileCurrentInstrumentIfChanged() {
+    saveCurrentInstrument();
+    if (!state.csoundReady) return;
+    var idx = state.currentInstrument;
+    var currentCode = state.instruments[idx] || '';
+    var lastCode = lastCompiled.instruments[idx] || '';
+    if (currentCode !== lastCode) {
+        compileSingleInstrument(idx);
+    }
 }
 
 function initSampleLoader() {
@@ -6988,11 +10238,17 @@ var pianoRoll = {
     ctx: null,
     velocityCanvas: null,
     velocityCtx: null,
+    velocityGrid: null,
     keysContainer: null,
+    gridContainer: null,
     pixelsPerBeat: 40,
     noteHeight: 16,
+    velocityLaneHeight: 50,
+    velocityParam: 'p5',
     octaves: 9,  // C0 to C8
     lowestNote: 24,  // C1 (MIDI note 24)
+    bgCacheCanvas: null,
+    bgCacheKey: '',
     // State for interactions
     isDragging: false,
     dragMode: null,  // 'move', 'resize', 'draw'
@@ -7001,13 +10257,32 @@ var pianoRoll = {
     dragStartPitch: 0,
     dragNote: null,
     dragNoteIndex: -1,
-    originalNoteData: null
+    originalNoteData: null,
+    lastClickBeat: 0,
+    lastClickPitch: null,
+    drawPreviewPitch: null,
+    docTracking: false,
+    velocityDragging: false,
+    velocityDragIndices: null
 };
+
+var pianoRollRenderPending = false;
+
+function scheduleRenderPianoRoll() {
+    if (pianoRollRenderPending) return;
+    pianoRollRenderPending = true;
+    requestAnimationFrame(function() {
+        pianoRollRenderPending = false;
+        renderPianoRoll();
+    });
+}
 
 function initPianoRoll() {
     pianoRoll.canvas = document.getElementById('piano-roll-canvas');
     pianoRoll.velocityCanvas = document.getElementById('velocity-canvas');
     pianoRoll.keysContainer = document.getElementById('piano-keys');
+    pianoRoll.gridContainer = document.querySelector('.piano-roll-grid');
+    pianoRoll.velocityGrid = document.querySelector('.velocity-grid');
 
     if (pianoRoll.canvas) {
         pianoRoll.ctx = pianoRoll.canvas.getContext('2d');
@@ -7015,11 +10290,43 @@ function initPianoRoll() {
         pianoRoll.canvas.addEventListener('mousemove', handlePianoRollMouseMove);
         pianoRoll.canvas.addEventListener('mouseup', handlePianoRollMouseUp);
         pianoRoll.canvas.addEventListener('mouseleave', handlePianoRollMouseUp);
+        pianoRoll.canvas.addEventListener('dblclick', handlePianoRollDblClick);
         pianoRoll.canvas.addEventListener('contextmenu', handlePianoRollContextMenu);
     }
 
     if (pianoRoll.velocityCanvas) {
         pianoRoll.velocityCtx = pianoRoll.velocityCanvas.getContext('2d');
+        pianoRoll.velocityCanvas.addEventListener('mousedown', handleVelocityMouseDown);
+        pianoRoll.velocityCanvas.addEventListener('mousemove', handleVelocityMouseMove);
+        pianoRoll.velocityCanvas.addEventListener('mouseup', handleVelocityMouseUp);
+        pianoRoll.velocityCanvas.addEventListener('mouseleave', handleVelocityMouseUp);
+    }
+
+    if (pianoRoll.gridContainer && pianoRoll.keysContainer) {
+        pianoRoll.gridContainer.addEventListener('scroll', function() {
+            pianoRoll.keysContainer.scrollTop = pianoRoll.gridContainer.scrollTop;
+            if (pianoRoll.velocityGrid) {
+                pianoRoll.velocityGrid.scrollLeft = pianoRoll.gridContainer.scrollLeft;
+            } else if (pianoRoll.velocityCanvas) {
+                pianoRoll.velocityCanvas.style.transform = 'translateX(' + (-pianoRoll.gridContainer.scrollLeft) + 'px)';
+            }
+        });
+
+        pianoRoll.gridContainer.addEventListener('wheel', function(e) {
+            if (e.ctrlKey) {
+                e.preventDefault();
+                var factor = e.deltaY > 0 ? 0.9 : 1.1;
+                zoomPianoRoll(factor);
+                return;
+            }
+        }, { passive: false });
+
+        pianoRoll.keysContainer.addEventListener('wheel', function(e) {
+            if (!pianoRoll.gridContainer) return;
+            pianoRoll.gridContainer.scrollTop += e.deltaY;
+            pianoRoll.gridContainer.scrollLeft += e.deltaX;
+            e.preventDefault();
+        }, { passive: false });
     }
 
     // Quantize selector
@@ -7029,6 +10336,16 @@ function initPianoRoll() {
             pianoRoll.quantize = parseFloat(this.value) || 0.25;
         });
         pianoRoll.quantize = parseFloat(quantizeSelect.value) || 0.25;
+    }
+
+    // Velocity/parameter lane selector (p5-p13)
+    var velocitySelect = document.getElementById('velocity-param-select');
+    if (velocitySelect) {
+        velocitySelect.addEventListener('change', function() {
+            pianoRoll.velocityParam = this.value || 'p5';
+            scheduleRenderPianoRoll();
+        });
+        pianoRoll.velocityParam = velocitySelect.value || 'p5';
     }
 
     // Zoom buttons
@@ -7048,7 +10365,120 @@ function initPianoRoll() {
         });
     }
 
+    // Keyboard shortcuts for piano roll
+    document.addEventListener('keydown', function(e) {
+        // Only handle when piano roll is visible
+        var pianoContainer = document.getElementById('piano-roll-container');
+        if (!pianoContainer || pianoContainer.classList.contains('hidden')) return;
+
+        // Don't handle if focus is in a text input
+        if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
+
+        var pattern = getCurrentPattern();
+        if (!pattern || pattern.type !== 'piano') return;
+
+        // Delete key - delete selected note
+        if (e.key === 'Delete' && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+            if (pianoSelection.selectedNotes && pianoSelection.selectedNotes.length > 0) {
+                e.preventDefault();
+                deleteSelection();
+                return;
+            }
+            if (pianoRoll.dragNote && pianoRoll.dragNoteIndex >= 0) {
+                e.preventDefault();
+                var notes = pattern.notes || [];
+                if (pianoRoll.dragNoteIndex < notes.length) {
+                    notes.splice(pianoRoll.dragNoteIndex, 1);
+                    pianoRoll.dragNote = null;
+                    pianoRoll.dragNoteIndex = -1;
+                    markPatternNoteVizDirtyForPattern(pattern);
+                    scheduleRenderPianoRoll();
+                }
+                return;
+            }
+        }
+
+        // Ctrl+D - duplicate selected note
+        if (e.ctrlKey && (e.key === 'd' || e.key === 'D') && !e.altKey && !e.shiftKey) {
+            if (pianoRoll.dragNote) {
+                e.preventDefault();
+                var notes = pattern.notes || [];
+                var newNote = {
+                    pitch: pianoRoll.dragNote.pitch,
+                    startBeat: pianoRoll.dragNote.startBeat + pianoRoll.dragNote.duration,
+                    duration: pianoRoll.dragNote.duration,
+                    velocity: pianoRoll.dragNote.velocity || 0.8
+                };
+                notes.push(newNote);
+                markPatternNoteVizDirtyForPattern(pattern);
+                // Select the new note
+                pianoRoll.dragNote = newNote;
+                pianoRoll.dragNoteIndex = notes.length - 1;
+                scheduleRenderPianoRoll();
+                return;
+            }
+        }
+
+        // Arrow keys - move selected note
+        if (pianoRoll.dragNote && (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+            e.preventDefault();
+            var quantize = pianoRoll.quantize || 0.25;
+
+            if (e.key === 'ArrowUp') {
+                pianoRoll.dragNote.pitch = Math.min(127, pianoRoll.dragNote.pitch + 1);
+            } else if (e.key === 'ArrowDown') {
+                pianoRoll.dragNote.pitch = Math.max(0, pianoRoll.dragNote.pitch - 1);
+            } else if (e.key === 'ArrowLeft') {
+                pianoRoll.dragNote.startBeat = Math.max(0, pianoRoll.dragNote.startBeat - quantize);
+            } else if (e.key === 'ArrowRight') {
+                pianoRoll.dragNote.startBeat += quantize;
+            }
+            markPatternNoteVizDirtyForPattern(pattern);
+            scheduleRenderPianoRoll();
+            return;
+        }
+
+        // +/- keys - change note duration
+        if (pianoRoll.dragNote && (e.key === '+' || e.key === '=' || e.key === '-' || e.key === '_')) {
+            e.preventDefault();
+            var quantize = pianoRoll.quantize || 0.25;
+            if (e.key === '+' || e.key === '=') {
+                pianoRoll.dragNote.duration += quantize;
+            } else {
+                pianoRoll.dragNote.duration = Math.max(quantize, pianoRoll.dragNote.duration - quantize);
+            }
+            markPatternNoteVizDirtyForPattern(pattern);
+            scheduleRenderPianoRoll();
+            return;
+        }
+    });
+
     renderPianoKeys();
+}
+
+function attachCodeEditorShortcuts() {
+    var codeEditor = document.getElementById('code-editor');
+    if (codeEditor) {
+        codeEditor.addEventListener('keydown', function(e) {
+            if (e.altKey && (e.code === 'KeyC' || e.key === 'c' || e.key === 'C')) {
+                e.preventDefault();
+                e.stopPropagation();
+                compileCurrentInstrumentIfChanged();
+            }
+        }, true);
+    }
+
+    var opcodesEditor = document.getElementById('opcodes-editor');
+    if (opcodesEditor) {
+        opcodesEditor.addEventListener('keydown', function(e) {
+            if (e.altKey && (e.code === 'KeyC' || e.key === 'c' || e.key === 'C')) {
+                e.preventDefault();
+                e.stopPropagation();
+                saveOpcodes();
+                compileOpcodesIfChanged();
+            }
+        }, true);
+    }
 }
 
 // Update piano roll instrument selector with available instruments
@@ -7061,31 +10491,21 @@ function updatePianoInstrumentSelector() {
 
     select.innerHTML = '';
 
-    // Add all available instruments (1-128, but show ftable names if available)
-    for (var i = 1; i <= 16; i++) {
+    // Match pattern editor: list all instrument numbers
+    var maxInstr = Math.max(1, state.instruments ? state.instruments.length : 128);
+    for (var i = 1; i <= maxInstr; i++) {
         var option = document.createElement('option');
         option.value = i;
-
-        // Check if there's an ftable with this number
-        var ftable = null;
-        for (var j = 0; j < state.ftablePool.length; j++) {
-            if (state.ftablePool[j].tableNum === i) {
-                ftable = state.ftablePool[j];
-                break;
-            }
-        }
-
-        if (ftable && ftable.name) {
-            option.textContent = i + ': ' + ftable.name;
-        } else {
-            option.textContent = i + ': Synth ' + i;
-        }
-
+        option.textContent = i;
         if (i === currentInstr) {
             option.selected = true;
         }
 
         select.appendChild(option);
+    }
+
+    if (!select.value) {
+        select.value = String(Math.max(1, Math.min(currentInstr, maxInstr)));
     }
 }
 
@@ -7107,20 +10527,32 @@ function renderPianoKeys() {
         key.addEventListener('mousedown', function(e) {
             var note = parseInt(this.getAttribute('data-note'));
             previewMidiNote(note, 100);
+            startPianoRollRecordNote(note, 100);
             this.classList.add('playing');
         });
         key.addEventListener('mouseup', function() {
             var note = parseInt(this.getAttribute('data-note'));
             stopMidiNote(note);
+            finishPianoRollRecordNote(note);
             this.classList.remove('playing');
         });
         key.addEventListener('mouseleave', function() {
             var note = parseInt(this.getAttribute('data-note'));
             stopMidiNote(note);
+            finishPianoRollRecordNote(note);
             this.classList.remove('playing');
         });
 
         pianoRoll.keysContainer.appendChild(key);
+    }
+
+    // Keep note height aligned to actual key height (responsive layouts)
+    var firstKey = pianoRoll.keysContainer.firstChild;
+    if (firstKey) {
+        var keyHeight = Math.round(firstKey.getBoundingClientRect().height);
+        if (keyHeight > 0 && keyHeight !== pianoRoll.noteHeight) {
+            pianoRoll.noteHeight = keyHeight;
+        }
     }
 }
 
@@ -7154,68 +10586,176 @@ function renderPianoRoll() {
         return;
     }
 
+    if (pianoRoll.keysContainer && pianoRoll.keysContainer.firstChild) {
+        var keyHeight = Math.round(pianoRoll.keysContainer.firstChild.getBoundingClientRect().height);
+        if (keyHeight > 0 && keyHeight !== pianoRoll.noteHeight) {
+            pianoRoll.noteHeight = keyHeight;
+        }
+    }
+
     var patternBeats = pattern.beats || 4;
     var patternLpb = pattern.lpb || state.lpb;
     var totalNotes = pianoRoll.octaves * 12;
+    var displayBeats = patternBeats;
+    var showRecordingPreview = state.isRecording && recordingPreviewBeats > patternBeats + 0.0001;
+    if (showRecordingPreview) {
+        displayBeats = recordingPreviewBeats;
+    }
 
     // Size canvas
-    var width = Math.max(400, patternBeats * pianoRoll.pixelsPerBeat);
+    var width = Math.max(400, displayBeats * pianoRoll.pixelsPerBeat);
     var height = totalNotes * pianoRoll.noteHeight;
     pianoRoll.canvas.width = width;
     pianoRoll.canvas.height = height;
 
     var ctx = pianoRoll.ctx;
 
-    // Clear
-    ctx.fillStyle = '#1a1a2e';
-    ctx.fillRect(0, 0, width, height);
+    // Cache static background (rows + beat highlights + grid lines)
+    var bgKey = [
+        width,
+        height,
+        displayBeats,
+        patternLpb,
+        pianoRoll.pixelsPerBeat,
+        pianoRoll.noteHeight,
+        pianoRoll.octaves,
+        pianoRoll.lowestNote
+    ].join('|');
 
-    // Draw horizontal lines and row backgrounds
-    for (var i = 0; i < totalNotes; i++) {
-        var y = i * pianoRoll.noteHeight;
-        var noteNum = pianoRoll.lowestNote + (totalNotes - i - 1);
-        var isBlack = [1, 3, 6, 8, 10].indexOf(noteNum % 12) !== -1;
+    if (!pianoRoll.bgCacheCanvas || pianoRoll.bgCacheKey !== bgKey) {
+        var bg = document.createElement('canvas');
+        bg.width = width;
+        bg.height = height;
+        var bgCtx = bg.getContext('2d');
 
-        // Alternate row colors
-        if (isBlack) {
-            ctx.fillStyle = '#12122a';
-            ctx.fillRect(0, y, width, pianoRoll.noteHeight);
+        bgCtx.fillStyle = '#1a1a2e';
+        bgCtx.fillRect(0, 0, width, height);
+
+        for (var i = 0; i < totalNotes; i++) {
+            var y = i * pianoRoll.noteHeight;
+            var noteNum = pianoRoll.lowestNote + (totalNotes - i - 1);
+            var isBlack = [1, 3, 6, 8, 10].indexOf(noteNum % 12) !== -1;
+
+            if (isBlack) {
+                bgCtx.fillStyle = '#12122a';
+                bgCtx.fillRect(0, y, width, pianoRoll.noteHeight);
+            }
+
+            bgCtx.strokeStyle = '#0f3460';
+            bgCtx.lineWidth = 1;
+            bgCtx.beginPath();
+            bgCtx.moveTo(0, y);
+            bgCtx.lineTo(width, y);
+            bgCtx.stroke();
         }
 
-        // Row line
-        ctx.strokeStyle = '#0f3460';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(width, y);
-        ctx.stroke();
+        var beatCount = Math.ceil(displayBeats);
+        for (var b = 0; b < beatCount; b++) {
+            var bx = b * pianoRoll.pixelsPerBeat;
+            var bxEnd = Math.min(width, (b + 1) * pianoRoll.pixelsPerBeat);
+            var bw = bxEnd - bx;
+            if (bw <= 0) continue;
+            bgCtx.fillStyle = (b % 2 === 0) ? 'rgba(255, 255, 255, 0.05)' : 'rgba(0, 0, 0, 0.08)';
+            bgCtx.fillRect(bx, 0, bw, height);
+        }
+
+        var stepsPerBeat = patternLpb;
+        var totalSteps = displayBeats * stepsPerBeat;
+        for (var step = 0; step <= totalSteps; step++) {
+            var gx = (step / stepsPerBeat) * pianoRoll.pixelsPerBeat;
+            var isBeat = step % stepsPerBeat === 0;
+            var isBar = step % (stepsPerBeat * 4) === 0;
+
+            bgCtx.strokeStyle = isBar ? '#2a4a7a' : (isBeat ? '#1a3a5a' : '#0f3460');
+            bgCtx.lineWidth = isBar ? 2 : 1;
+            bgCtx.beginPath();
+            bgCtx.moveTo(gx, 0);
+            bgCtx.lineTo(gx, height);
+            bgCtx.stroke();
+        }
+
+        pianoRoll.bgCacheCanvas = bg;
+        pianoRoll.bgCacheKey = bgKey;
     }
 
-    // Draw vertical grid lines
-    var stepsPerBeat = patternLpb;
-    var totalSteps = patternBeats * stepsPerBeat;
-    for (var step = 0; step <= totalSteps; step++) {
-        var x = (step / stepsPerBeat) * pianoRoll.pixelsPerBeat;
-        var isBeat = step % stepsPerBeat === 0;
-        var isBar = step % (stepsPerBeat * 4) === 0;
+    ctx.drawImage(pianoRoll.bgCacheCanvas, 0, 0);
 
-        ctx.strokeStyle = isBar ? '#2a4a7a' : (isBeat ? '#1a3a5a' : '#0f3460');
-        ctx.lineWidth = isBar ? 2 : 1;
-        ctx.beginPath();
-        ctx.moveTo(x, 0);
-        ctx.lineTo(x, height);
-        ctx.stroke();
+    if (showRecordingPreview) {
+        var previewX = patternBeats * pianoRoll.pixelsPerBeat;
+        var previewW = Math.max(0, width - previewX);
+        if (previewW > 0) {
+            ctx.save();
+            ctx.fillStyle = 'rgba(255, 68, 68, 0.08)';
+            ctx.fillRect(previewX, 0, previewW, height);
+            ctx.strokeStyle = 'rgba(255, 68, 68, 0.6)';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(previewX, 0);
+            ctx.lineTo(previewX, height);
+            ctx.stroke();
+            ctx.restore();
+        }
     }
 
     // Draw notes from pattern
     var notes = pattern.notes || [];
     for (var i = 0; i < notes.length; i++) {
         var note = notes[i];
-        var isSelected = pianoRoll.dragNote === note;
+        if (!isNoteEvent(note)) continue;
+        var isSelected = pianoRoll.dragNote === note || pianoSelection.selectedNotes.indexOf(i) >= 0;
         drawPianoNote(ctx, note, isSelected);
     }
 
+    // Draw selected paste position
+    if (typeof pianoRoll.lastClickBeat === 'number') {
+        var posX = pianoRoll.lastClickBeat * pianoRoll.pixelsPerBeat;
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.75)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(posX, 0);
+        ctx.lineTo(posX, height);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.restore();
+    }
+
+    // Draw selection rectangle if active
+    if (pianoSelection.active && pianoRoll.dragMode === 'select') {
+        var selStartX = pianoSelection.startBeat * pianoRoll.pixelsPerBeat;
+        var selEndX = pianoSelection.endBeat * pianoRoll.pixelsPerBeat;
+        var selStartY = (totalNotes - (pianoSelection.startPitch - pianoRoll.lowestNote) - 1) * pianoRoll.noteHeight;
+        var selEndY = (totalNotes - (pianoSelection.endPitch - pianoRoll.lowestNote) - 1) * pianoRoll.noteHeight;
+
+        var rectX = Math.min(selStartX, selEndX);
+        var rectY = Math.min(selStartY, selEndY);
+        var rectW = Math.abs(selEndX - selStartX);
+        var rectH = Math.abs(selEndY - selStartY);
+
+        ctx.strokeStyle = '#4ecca3';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(rectX, rectY, rectW, rectH);
+        ctx.fillStyle = 'rgba(78, 204, 163, 0.15)';
+        ctx.fillRect(rectX, rectY, rectW, rectH);
+    }
+
+    // Playhead is shown only in the song view
+
     renderVelocityLane();
+
+    if (!state.isPlaying) {
+        flushPatternNoteVizDirty();
+    }
+
+    if (pianoRoll.gridContainer && pianoRoll.keysContainer) {
+        pianoRoll.keysContainer.scrollTop = pianoRoll.gridContainer.scrollTop;
+        if (pianoRoll.velocityGrid) {
+            pianoRoll.velocityGrid.scrollLeft = pianoRoll.gridContainer.scrollLeft;
+        } else if (pianoRoll.velocityCanvas) {
+            pianoRoll.velocityCanvas.style.transform = 'translateX(' + (-pianoRoll.gridContainer.scrollLeft) + 'px)';
+        }
+    }
 }
 
 function drawPianoNote(ctx, note, isSelected) {
@@ -7223,6 +10763,7 @@ function drawPianoNote(ctx, note, isSelected) {
     var noteRow = totalNotes - (note.pitch - pianoRoll.lowestNote) - 1;
 
     if (noteRow < 0 || noteRow >= totalNotes) return;  // Out of range
+    if (typeof note.duration !== 'number' || note.duration <= 0) return;
 
     var y = noteRow * pianoRoll.noteHeight;
     var x = note.startBeat * pianoRoll.pixelsPerBeat;
@@ -7251,31 +10792,213 @@ function renderVelocityLane() {
     if (!pattern || pattern.type !== 'piano') return;
 
     var patternBeats = pattern.beats || 4;
+    var laneHeight = pianoRoll.velocityLaneHeight || 50;
     var canvas = pianoRoll.velocityCanvas;
     var ctx = pianoRoll.velocityCtx;
+    var paramIndex = getPianoParamIndex();
 
     canvas.width = Math.max(400, patternBeats * pianoRoll.pixelsPerBeat);
-    canvas.height = 60;
+    canvas.height = laneHeight;
 
     ctx.fillStyle = '#12122a';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillRect(0, 0, canvas.width, laneHeight);
 
-    // Draw velocity bars for each note
+    // Draw parameter bars for each note
     var notes = pattern.notes || [];
     for (var i = 0; i < notes.length; i++) {
         var note = notes[i];
+        if (!isNoteEvent(note)) continue;
         var x = note.startBeat * pianoRoll.pixelsPerBeat;
-        var h = (note.velocity || 0.8) * 50;
+        var value = getPianoNoteParamValue(note, paramIndex);
+        var h = Math.max(0, Math.min(1, value)) * laneHeight;
 
         ctx.fillStyle = '#4ecca3';
-        ctx.fillRect(x + 2, 60 - h, 8, h);
+        ctx.fillRect(x + 2, laneHeight - h, 8, h);
     }
 }
 
-function midiToNoteName(midiNote) {
-    var octave = Math.floor(midiNote / 12) - 1;
-    var noteIdx = midiNote % 12;
-    return noteNames[noteIdx] + '-' + octave;
+function getVelocityTargetsAtX(pattern, x) {
+    if (!pattern || pattern.type !== 'piano') return [];
+    var notes = pattern.notes || [];
+    if (notes.length === 0) return [];
+
+    var clickBeat = x / pianoRoll.pixelsPerBeat;
+    var thresholdPx = Math.max(6, Math.min(12, pianoRoll.pixelsPerBeat * 0.3));
+    var thresholdBeats = thresholdPx / pianoRoll.pixelsPerBeat;
+    var hits = [];
+
+    for (var i = 0; i < notes.length; i++) {
+        if (!isNoteEvent(notes[i])) continue;
+        if (Math.abs(notes[i].startBeat - clickBeat) <= thresholdBeats) {
+            hits.push(i);
+        }
+    }
+
+    if (hits.length === 0) return [];
+    if (pianoSelection.selectedNotes.length > 0) {
+        var selectedHits = [];
+        for (var j = 0; j < pianoSelection.selectedNotes.length; j++) {
+            var idx = pianoSelection.selectedNotes[j];
+            if (hits.indexOf(idx) >= 0) {
+                selectedHits.push(idx);
+            }
+        }
+        if (selectedHits.length > 0) return selectedHits;
+    }
+
+    return hits;
+}
+
+function velocityFromY(y, height) {
+    var laneHeight = height || pianoRoll.velocityLaneHeight || 50;
+    var v = (laneHeight - y) / laneHeight;
+    return Math.max(0, Math.min(1, v));
+}
+
+function getPianoParamIndex() {
+    if (!pianoRoll.velocityParam || pianoRoll.velocityParam === 'p5') return -1;
+    var num = parseInt(pianoRoll.velocityParam.replace('p', ''), 10);
+    if (isNaN(num) || num < 6) return -1;
+    return num - 6;
+}
+
+function getPianoNoteParamValue(note, paramIndex) {
+    if (!note) return 0;
+    if (paramIndex < 0) {
+        return (note.velocity === null || note.velocity === undefined) ? 0.5 : note.velocity;
+    }
+    var fxArr = note.fx || [];
+    var val = fxArr[paramIndex];
+    if (typeof val === 'number') {
+        return val;
+    }
+    if (typeof val === 'string' && val !== '' && val !== '--' && val !== '----') {
+        var parsed = parseInt(val, 16);
+        if (!isNaN(parsed)) {
+            return parsed / 65535;
+        }
+    }
+    return 0;
+}
+
+function setPianoNoteParamValue(note, paramIndex, value) {
+    if (!note) return;
+    if (paramIndex < 0) {
+        note.velocity = value;
+        return;
+    }
+    if (!note.fx) note.fx = [];
+    while (note.fx.length <= paramIndex) {
+        note.fx.push(0);
+    }
+    note.fx[paramIndex] = value;
+}
+
+function getPianoRollPoint(e, clamp) {
+    var rect = pianoRoll.canvas.getBoundingClientRect();
+    var scale = getUiScale();
+    var x = (e.clientX - rect.left) / scale;
+    var y = (e.clientY - rect.top) / scale;
+    if (clamp && pianoRoll.canvas) {
+        var maxX = pianoRoll.canvas.width;
+        var maxY = pianoRoll.canvas.height;
+        x = Math.max(0, Math.min(maxX, x));
+        y = Math.max(0, Math.min(maxY, y));
+    }
+    return { x: x, y: y };
+}
+
+function startPianoRollDocTracking() {
+    if (pianoRoll.docTracking) return;
+    document.addEventListener('mousemove', handlePianoRollMouseMove);
+    document.addEventListener('mouseup', handlePianoRollMouseUp);
+    pianoRoll.docTracking = true;
+}
+
+function stopPianoRollDocTracking() {
+    if (!pianoRoll.docTracking) return;
+    document.removeEventListener('mousemove', handlePianoRollMouseMove);
+    document.removeEventListener('mouseup', handlePianoRollMouseUp);
+    pianoRoll.docTracking = false;
+}
+
+function getVelocityCanvasPoint(e) {
+    var rect = pianoRoll.velocityCanvas.getBoundingClientRect();
+    var scale = getUiScale();
+    var x = (e.clientX - rect.left) / scale;
+    var y = (e.clientY - rect.top) / scale;
+
+    if (pianoRoll.velocityGrid) {
+        x += pianoRoll.velocityGrid.scrollLeft;
+    }
+
+    return { x: x, y: y, height: rect.height / scale };
+}
+
+function applyVelocityToNotes(pattern, indices, y, height) {
+    if (!pattern || pattern.type !== 'piano') return;
+    if (!indices || indices.length === 0) return;
+
+    var notes = pattern.notes || [];
+    var v = velocityFromY(y, height);
+    var paramIndex = getPianoParamIndex();
+    for (var i = 0; i < indices.length; i++) {
+        var idx = indices[i];
+        if (notes[idx]) {
+            setPianoNoteParamValue(notes[idx], paramIndex, v);
+        }
+    }
+    markPatternNoteVizDirtyForPattern(pattern);
+}
+
+function handleVelocityMouseDown(e) {
+    if (e.button !== 0) return;
+    uiFocus = 'piano';
+
+    var pattern = getCurrentPattern();
+    if (!pattern || pattern.type !== 'piano') return;
+
+    var pt = getVelocityCanvasPoint(e);
+
+    var indices = getVelocityTargetsAtX(pattern, pt.x);
+    if (indices.length === 0) return;
+
+    pianoRoll.velocityDragging = true;
+    pianoRoll.velocityDragIndices = indices;
+
+    pushUndo('piano-edit', captureStateForUndo('piano-edit'));
+
+    applyVelocityToNotes(pattern, indices, pt.y, pt.height);
+    scheduleRenderPianoRoll();
+    e.preventDefault();
+}
+
+function handleVelocityMouseMove(e) {
+    if (!pianoRoll.velocityCanvas) return;
+
+    var pattern = getCurrentPattern();
+    if (!pattern || pattern.type !== 'piano') return;
+
+    var pt = getVelocityCanvasPoint(e);
+
+    if (!pianoRoll.velocityDragging) {
+        var hits = getVelocityTargetsAtX(pattern, pt.x);
+        pianoRoll.velocityCanvas.style.cursor = hits.length > 0 ? 'ns-resize' : 'default';
+        return;
+    }
+
+    applyVelocityToNotes(pattern, pianoRoll.velocityDragIndices || [], pt.y, pt.height);
+    scheduleRenderPianoRoll();
+    e.preventDefault();
+}
+
+function handleVelocityMouseUp() {
+    if (!pianoRoll.velocityDragging) return;
+    pianoRoll.velocityDragging = false;
+    pianoRoll.velocityDragIndices = null;
+    if (pianoRoll.velocityCanvas) {
+        pianoRoll.velocityCanvas.style.cursor = 'default';
+    }
 }
 
 // Find note at canvas position
@@ -7291,6 +11014,8 @@ function findPianoNoteAt(x, y) {
 
     for (var i = notes.length - 1; i >= 0; i--) {  // Check from top (last drawn)
         var note = notes[i];
+        if (!isNoteEvent(note)) continue;
+        if (typeof note.duration !== 'number' || note.duration <= 0) continue;
         if (note.pitch !== clickPitch) continue;
 
         var noteStart = note.startBeat;
@@ -7309,20 +11034,60 @@ function findPianoNoteAt(x, y) {
 function handlePianoRollMouseDown(e) {
     if (e.button !== 0) return;  // Left click only
 
-    var rect = pianoRoll.canvas.getBoundingClientRect();
-    var x = e.clientX - rect.left;
-    var y = e.clientY - rect.top;
+    uiFocus = 'piano';
+    var pt = getPianoRollPoint(e, true);
+    var x = pt.x;
+    var y = pt.y;
 
     var pattern = getCurrentPattern();
     if (!pattern || pattern.type !== 'piano') return;
 
+    var totalNotes = pianoRoll.octaves * 12;
+    var quantize = pianoRoll.quantize || 0.25;
+    var clickBeat = x / pianoRoll.pixelsPerBeat;
+    var snappedBeat = Math.max(0, Math.round(clickBeat / quantize) * quantize);
+    var clickRow = Math.floor(y / pianoRoll.noteHeight);
+    var clickPitch = pianoRoll.lowestNote + (totalNotes - clickRow - 1);
+    pianoRoll.lastClickBeat = snappedBeat;
+    pianoRoll.lastClickPitch = clickPitch;
+
     var found = findPianoNoteAt(x, y);
+    var insertMode = e.ctrlKey;
 
-    pianoRoll.isDragging = true;
-    pianoRoll.dragStartX = x;
-    pianoRoll.dragStartY = y;
+    // Drag for selection box (when not inserting)
+    if (!insertMode && !found.note) {
+        pianoRoll.isDragging = true;
+        pianoRoll.dragStartX = x;
+        pianoRoll.dragStartY = y;
+        pianoRoll.dragMode = 'select';
+        pianoRoll.canvas.style.cursor = 'crosshair';
+        pianoSelection.active = true;
+        pianoSelection.startBeat = x / pianoRoll.pixelsPerBeat;
+        pianoSelection.startPitch = pianoRoll.lowestNote + (pianoRoll.octaves * 12 - Math.floor(y / pianoRoll.noteHeight) - 1);
+        if (!e.shiftKey) {
+            pianoSelection.selectedNotes = [];
+        }
+        pianoRoll.drawPreviewPitch = null;
+        startPianoRollDocTracking();
+        scheduleRenderPianoRoll();
+        return;
+    }
 
-    if (found.note) {
+    if (!insertMode && found.note) {
+        var idx = pianoSelection.selectedNotes.indexOf(found.index);
+        if (e.shiftKey) {
+            if (idx >= 0) {
+                pianoSelection.selectedNotes.splice(idx, 1);
+            } else {
+                pianoSelection.selectedNotes.push(found.index);
+            }
+        } else if (idx < 0) {
+            pianoSelection.selectedNotes = [found.index];
+        }
+
+        pianoRoll.isDragging = true;
+        pianoRoll.dragStartX = x;
+        pianoRoll.dragStartY = y;
         pianoRoll.dragNote = found.note;
         pianoRoll.dragNoteIndex = found.index;
         pianoRoll.originalNoteData = {
@@ -7331,6 +11096,9 @@ function handlePianoRollMouseDown(e) {
             pitch: found.note.pitch
         };
 
+        // Save undo state before modifying
+        pushUndo('piano-edit', captureStateForUndo('piano-edit'));
+
         if (found.edge) {
             pianoRoll.dragMode = 'resize';
             pianoRoll.canvas.style.cursor = 'ew-resize';
@@ -7338,25 +11106,51 @@ function handlePianoRollMouseDown(e) {
             pianoRoll.dragMode = 'move';
             pianoRoll.canvas.style.cursor = 'grabbing';
         }
-    } else {
-        pianoRoll.dragMode = 'draw';
-        pianoRoll.dragNote = null;
-        pianoRoll.dragNoteIndex = -1;
+
+        startPianoRollDocTracking();
+        scheduleRenderPianoRoll();
+        return;
     }
 
-    renderPianoRoll();
+    if (!insertMode) {
+        // Just set paste/position when not inserting; keep selection
+        pianoRoll.drawPreviewPitch = null;
+        scheduleRenderPianoRoll();
+        return;
+    }
+
+    pianoRoll.isDragging = true;
+    pianoRoll.dragStartX = x;
+    pianoRoll.dragStartY = y;
+    pianoRoll.dragMode = 'draw';
+    pianoRoll.dragNote = null;
+    pianoRoll.dragNoteIndex = -1;
+    pianoSelection.selectedNotes = [];  // Clear selection on empty click
+    if (clickPitch >= pianoRoll.lowestNote && clickPitch < pianoRoll.lowestNote + totalNotes) {
+        pianoRoll.drawPreviewPitch = clickPitch;
+        previewMidiNote(clickPitch, 100);
+    } else {
+        pianoRoll.drawPreviewPitch = null;
+    }
+
+    startPianoRollDocTracking();
+    scheduleRenderPianoRoll();
 }
 
 function handlePianoRollMouseMove(e) {
-    var rect = pianoRoll.canvas.getBoundingClientRect();
-    var x = e.clientX - rect.left;
-    var y = e.clientY - rect.top;
+    var pt = getPianoRollPoint(e, pianoRoll.isDragging);
+    var x = pt.x;
+    var y = pt.y;
 
     var pattern = getCurrentPattern();
     if (!pattern || pattern.type !== 'piano') return;
 
     // Update cursor when not dragging
     if (!pianoRoll.isDragging) {
+        if (e.ctrlKey) {
+            pianoRoll.canvas.style.cursor = 'crosshair';
+            return;
+        }
         var found = findPianoNoteAt(x, y);
         if (found.note) {
             pianoRoll.canvas.style.cursor = found.edge ? 'ew-resize' : 'pointer';
@@ -7369,13 +11163,22 @@ function handlePianoRollMouseMove(e) {
     var quantize = pianoRoll.quantize || 0.25;
     var totalNotes = pianoRoll.octaves * 12;
 
+    // Selection box mode
+    if (pianoRoll.dragMode === 'select') {
+        pianoSelection.endBeat = x / pianoRoll.pixelsPerBeat;
+        pianoSelection.endPitch = pianoRoll.lowestNote + (totalNotes - Math.floor(y / pianoRoll.noteHeight) - 1);
+        scheduleRenderPianoRoll();
+        return;
+    }
+
     if (pianoRoll.dragMode === 'resize' && pianoRoll.dragNote) {
         // Resize note duration
         var newEndBeat = x / pianoRoll.pixelsPerBeat;
         var newDuration = newEndBeat - pianoRoll.dragNote.startBeat;
         newDuration = Math.max(quantize, Math.round(newDuration / quantize) * quantize);
         pianoRoll.dragNote.duration = newDuration;
-        renderPianoRoll();
+        markPatternNoteVizDirtyForPattern(pattern);
+        scheduleRenderPianoRoll();
     } else if (pianoRoll.dragMode === 'move' && pianoRoll.dragNote) {
         // Move note position and pitch
         var deltaX = x - pianoRoll.dragStartX;
@@ -7391,32 +11194,61 @@ function handlePianoRollMouseMove(e) {
 
         pianoRoll.dragNote.startBeat = newStart;
         pianoRoll.dragNote.pitch = newPitch;
-        renderPianoRoll();
+        markPatternNoteVizDirtyForPattern(pattern);
+        scheduleRenderPianoRoll();
     }
 }
 
 function handlePianoRollMouseUp(e) {
-    if (!pianoRoll.isDragging) return;
+    if (!pianoRoll.isDragging) {
+        stopPianoRollDocTracking();
+        return;
+    }
+    if (e && e.type === 'mouseleave') return;
 
-    var rect = pianoRoll.canvas.getBoundingClientRect();
-    var x = e.clientX - rect.left;
-    var y = e.clientY - rect.top;
+    var pt = getPianoRollPoint(e, true);
+    var x = pt.x;
+    var y = pt.y;
 
     var pattern = getCurrentPattern();
+    var didChange = false;
 
-    if (pianoRoll.dragMode === 'draw' && pattern && pattern.type === 'piano') {
+    // Finalize selection box
+    if (pianoRoll.dragMode === 'select' && pattern && pattern.type === 'piano') {
+        var notes = pattern.notes || [];
+        var minBeat = Math.min(pianoSelection.startBeat, pianoSelection.endBeat);
+        var maxBeat = Math.max(pianoSelection.startBeat, pianoSelection.endBeat);
+        var minPitch = Math.min(pianoSelection.startPitch, pianoSelection.endPitch);
+        var maxPitch = Math.max(pianoSelection.startPitch, pianoSelection.endPitch);
+
+        pianoSelection.selectedNotes = [];
+        for (var i = 0; i < notes.length; i++) {
+            var n = notes[i];
+            var noteEnd = n.startBeat + n.duration;
+            // Check if note intersects selection box
+            if (n.startBeat < maxBeat && noteEnd > minBeat && n.pitch >= minPitch && n.pitch <= maxPitch) {
+                pianoSelection.selectedNotes.push(i);
+            }
+        }
+        pianoSelection.active = false;
+        consoleLog('Selected ' + pianoSelection.selectedNotes.length + ' notes');
+    } else if (pianoRoll.dragMode === 'draw' && pattern && pattern.type === 'piano') {
         // Create new note
         var quantize = pianoRoll.quantize || 0.25;
         var totalNotes = pianoRoll.octaves * 12;
 
         var beat = x / pianoRoll.pixelsPerBeat;
-        beat = Math.max(0, Math.floor(beat / quantize) * quantize);
+        beat = Math.max(0, Math.round(beat / quantize) * quantize);
 
         var row = Math.floor(y / pianoRoll.noteHeight);
         var pitch = pianoRoll.lowestNote + (totalNotes - row - 1);
 
         if (pitch >= pianoRoll.lowestNote && pitch < pianoRoll.lowestNote + totalNotes) {
+            // Save undo state
+            pushUndo('piano-edit', captureStateForUndo('piano-edit'));
+
             var newNote = {
+                type: 'note',
                 pitch: pitch,
                 startBeat: beat,
                 duration: quantize,
@@ -7425,9 +11257,12 @@ function handlePianoRollMouseUp(e) {
 
             if (!pattern.notes) pattern.notes = [];
             pattern.notes.push(newNote);
+            didChange = true;
 
             // Preview the note
-            previewMidiNote(pitch, Math.floor(newNote.velocity * 127));
+            if (pianoRoll.drawPreviewPitch === null) {
+                previewMidiNote(pitch, Math.floor(newNote.velocity * 127));
+            }
         }
     } else if (pianoRoll.dragMode === 'resize' || pianoRoll.dragMode === 'move') {
         // Auto-extend pattern if note goes beyond
@@ -7436,7 +11271,11 @@ function handlePianoRollMouseUp(e) {
             if (noteEnd > pattern.beats) {
                 pattern.beats = Math.ceil(noteEnd);
                 renderTimeline();
+                didChange = true;
             }
+        }
+        if (pianoRoll.dragNote) {
+            didChange = true;
         }
     }
 
@@ -7448,25 +11287,61 @@ function handlePianoRollMouseUp(e) {
     pianoRoll.originalNoteData = null;
     pianoRoll.canvas.style.cursor = 'crosshair';
 
-    renderPianoRoll();
+    if (pianoRoll.drawPreviewPitch !== null) {
+        stopMidiNote(pianoRoll.drawPreviewPitch);
+        pianoRoll.drawPreviewPitch = null;
+    }
+
+    if (didChange && pattern) {
+        markPatternNoteVizDirtyForPattern(pattern);
+    }
+
+    scheduleRenderPianoRoll();
+    stopPianoRollDocTracking();
 }
 
 function handlePianoRollContextMenu(e) {
     e.preventDefault();
+    uiFocus = 'piano';
+
+    var menu = document.getElementById('piano-roll-context-menu');
+    if (!menu) return;
 
     var rect = pianoRoll.canvas.getBoundingClientRect();
-    var x = e.clientX - rect.left;
-    var y = e.clientY - rect.top;
+    var scale = getUiScale();
+    var x = (e.clientX - rect.left) / scale;
+    var y = (e.clientY - rect.top) / scale;
 
     var pattern = getCurrentPattern();
     if (!pattern || pattern.type !== 'piano') return;
 
+    var totalNotes = pianoRoll.octaves * 12;
+    var quantize = pianoRoll.quantize || 0.25;
+    var clickBeat = x / pianoRoll.pixelsPerBeat;
+    var snappedBeat = Math.max(0, Math.round(clickBeat / quantize) * quantize);
+    var clickRow = Math.floor(y / pianoRoll.noteHeight);
+    var clickPitch = pianoRoll.lowestNote + (totalNotes - clickRow - 1);
+    pianoRoll.lastClickBeat = snappedBeat;
+    pianoRoll.lastClickPitch = clickPitch;
+    pianoContextState.beat = snappedBeat;
+    pianoContextState.pitch = clickPitch;
+
     var found = findPianoNoteAt(x, y);
     if (found.note && found.index !== -1) {
-        // Delete the note
-        pattern.notes.splice(found.index, 1);
-        renderPianoRoll();
-        consoleLog('Deleted note ' + midiToNoteName(found.note.pitch));
+        if (pianoSelection.selectedNotes.indexOf(found.index) < 0) {
+            pianoSelection.selectedNotes = [found.index];
+        }
+    }
+
+    menu.classList.add('visible');
+    positionMenuAtClient(menu, e.clientX, e.clientY);
+
+    var submenu = menu.querySelector('.context-submenu[data-menu="quantize"]');
+    var quantizeItem = menu.querySelector('.context-menu-item.has-submenu[data-action="quantize"]');
+    if (submenu && quantizeItem) {
+        quantizeItem.classList.remove('open');
+        submenu.style.top = quantizeItem.offsetTop + 'px';
+        submenu.style.left = menu.offsetWidth + 6 + 'px';
     }
 }
 
@@ -7474,7 +11349,7 @@ function quantizeBeat(beat) {
     if (state.quantize === 'off') return beat;
 
     var grid = getQuantizeGrid();
-    return Math.floor(beat / grid) * grid;
+    return Math.round(beat / grid) * grid;
 }
 
 function getQuantizeGrid() {
@@ -7503,24 +11378,140 @@ function addNoteToPatterStep(pitch, beat, duration) {
     var noteCol = state.focusedNoteCol || 0;
 
     if (step >= 0 && step < pattern.steps) {
-        var stepData = pattern.data[step];
-        if (stepData && stepData.columns) {
-            // Ensure note column exists
-            while (stepData.columns.length <= noteCol) {
-                stepData.columns.push({ note: '', amp: '', fx: [] });
-            }
-            var colData = stepData.columns[noteCol];
-            colData.note = midiToNoteName(pitch);
-            colData.amp = 'FF';
-            invalidatePatternCache(getCurrentPatternIndex());
-            renderTrackerGrid(true);
-        }
+        setCellValue(step, noteCol, 0, 'note', midiToNoteName(pitch));
+        setCellValue(step, noteCol, 0, 'amp', 'FF');
+        invalidatePatternCache(getCurrentPatternIndex());
+        renderTrackerGrid(true);
     }
 }
 
 function zoomPianoRoll(factor) {
     pianoRoll.pixelsPerBeat = Math.max(10, Math.min(200, pianoRoll.pixelsPerBeat * factor));
-    renderPianoRoll();
+    scheduleRenderPianoRoll();
+}
+
+function hidePianoRollContextMenu() {
+    var menu = document.getElementById('piano-roll-context-menu');
+    if (menu) menu.classList.remove('visible');
+}
+
+function getSelectedPianoNoteIndices() {
+    if (pianoSelection.selectedNotes.length > 0) return pianoSelection.selectedNotes.slice();
+    if (pianoRoll.dragNoteIndex >= 0) return [pianoRoll.dragNoteIndex];
+    return [];
+}
+
+function insertPianoNoteAt(pattern, beat, pitch) {
+    if (!pattern || pattern.type !== 'piano') return;
+
+    var quantize = pianoRoll.quantize || 0.25;
+    var totalNotes = pianoRoll.octaves * 12;
+    var snappedBeat = Math.max(0, Math.round(beat / quantize) * quantize);
+
+    if (pitch < pianoRoll.lowestNote || pitch >= pianoRoll.lowestNote + totalNotes) return;
+
+    pushUndo('piano-edit', captureStateForUndo('piano-edit'));
+
+    var newNote = {
+        type: 'note',
+        pitch: pitch,
+        startBeat: snappedBeat,
+        duration: quantize,
+        velocity: 0.8
+    };
+
+    if (!pattern.notes) pattern.notes = [];
+    pattern.notes.push(newNote);
+    pianoSelection.selectedNotes = [pattern.notes.length - 1];
+    pianoRoll.lastClickBeat = snappedBeat;
+    pianoRoll.lastClickPitch = pitch;
+
+    markPatternNoteVizDirtyForPattern(pattern);
+    scheduleRenderPianoRoll();
+}
+
+function handlePianoRollDblClick(e) {
+    if (e.button !== 0) return;
+    uiFocus = 'piano';
+
+    var pattern = getCurrentPattern();
+    if (!pattern || pattern.type !== 'piano') return;
+
+    var pt = getPianoRollPoint(e, true);
+    var totalNotes = pianoRoll.octaves * 12;
+    var beat = pt.x / pianoRoll.pixelsPerBeat;
+    var row = Math.floor(pt.y / pianoRoll.noteHeight);
+    var pitch = pianoRoll.lowestNote + (totalNotes - row - 1);
+
+    insertPianoNoteAt(pattern, beat, pitch);
+}
+
+function quantizePianoNotes(grid) {
+    var pattern = getCurrentPattern();
+    if (!pattern || pattern.type !== 'piano') return;
+
+    var indices = getSelectedPianoNoteIndices();
+    if (indices.length === 0) {
+        consoleLog('No notes selected');
+        return;
+    }
+
+    var quantize = Math.max(0.0001, grid || 0.25);
+    pushUndo('piano-edit', captureStateForUndo('piano-edit'));
+
+    var maxEnd = pattern.beats || 0;
+    for (var i = 0; i < indices.length; i++) {
+        var idx = indices[i];
+        var note = pattern.notes[idx];
+        if (!note || !isNoteEvent(note)) continue;
+
+        var start = note.startBeat || 0;
+        var end = start + (note.duration || quantize);
+        var qStart = Math.round(start / quantize) * quantize;
+        var qEnd = Math.round(end / quantize) * quantize;
+
+        if (qEnd <= qStart + 0.0001) qEnd = qStart + quantize;
+
+        note.startBeat = Math.max(0, qStart);
+        note.duration = Math.max(quantize, qEnd - note.startBeat);
+
+        var noteEnd = note.startBeat + note.duration;
+        if (noteEnd > maxEnd) maxEnd = noteEnd;
+    }
+
+    if (maxEnd > pattern.beats) {
+        pattern.beats = Math.ceil(maxEnd);
+        pattern.steps = pattern.beats * (pattern.lpb || state.lpb);
+    }
+
+    markPatternNoteVizDirtyForPattern(pattern);
+    scheduleRenderPianoRoll();
+    consoleLog('Quantized ' + indices.length + ' note(s)');
+}
+
+function handlePianoRollContextAction(action, grid) {
+    hidePianoRollContextMenu();
+    uiFocus = 'piano';
+
+    if (action === 'copy') {
+        copySelection();
+        return;
+    }
+    if (action === 'cut') {
+        cutSelection();
+        return;
+    }
+    if (action === 'paste') {
+        pasteSelection();
+        return;
+    }
+    if (action === 'delete') {
+        deleteSelection();
+        return;
+    }
+    if (action === 'quantize') {
+        quantizePianoNotes(grid);
+    }
 }
 
 // Track active MIDI preview notes per track
@@ -7579,6 +11570,124 @@ var midiAccess = null;
 var activeMidiInput = null;
 var midiNoteVelocities = {};  // Track note velocities for recording
 var midiNoteStartBeats = {};  // Track note start beats for piano roll recording
+var recordingPreviewBeats = 0;  // Live preview of pattern expansion during recording
+var lastRecordingPreviewBeats = 0;  // Track changes to avoid excessive re-renders
+var recordingPreviewTimer = null;  // Timer for non-playback recording preview updates
+
+function applyRecordingPreviewToClip(pattern, clip) {
+    if (!state.isRecording) return false;
+    if (!pattern || !clip) return false;
+    if (clip.loopCount !== undefined && clip.loopCount > 1.0001) return false;
+    if (!recordingPreviewBeats || recordingPreviewBeats <= 0) return false;
+
+    var baseLoopLen = getClipLoopLength(clip, pattern);
+    if (recordingPreviewBeats <= baseLoopLen + 0.0001) return false;
+
+    if ((pattern.beats || 0) < recordingPreviewBeats - 0.0001) {
+        // Expand actual pattern length (also updates clip loopLength)
+        applyPatternLengthWithBuffer(pattern, clip, recordingPreviewBeats);
+    } else {
+        clip.loopLength = recordingPreviewBeats;
+        clip.loopCount = 1;
+    }
+
+    autoExtendTimeline();
+    return true;
+}
+
+function startPianoRollRecordNote(pitch, velocity) {
+    if (!state.isRecording) return false;
+
+    var pattern = getCurrentPattern();
+    if (!pattern || pattern.type !== 'piano') return false;
+
+    var quantizeBeats = pianoRoll.quantize || 0.25;
+    var startBeat;
+
+    if (state.isPlaying) {
+        var clip = getSelectedClip();
+        var relBeat = getPlaybackBeatNow() - (clip ? clip.startBeat : 0);
+        startBeat = Math.round(relBeat / quantizeBeats) * quantizeBeats;
+    } else {
+        if (pattern.notes && pattern.notes.length > 0) {
+            startBeat = Math.max.apply(null, pattern.notes.map(function(n) { return n.startBeat + n.duration; }));
+        } else {
+            startBeat = 0;
+        }
+        startBeat = Math.round(startBeat / quantizeBeats) * quantizeBeats;
+    }
+
+    startBeat = Math.max(0, startBeat);
+    midiNoteStartBeats[pitch] = {
+        beat: startBeat,
+        velocity: velocity,
+        startTime: performance.now()
+    };
+    return true;
+}
+
+function finishPianoRollRecordNote(pitch) {
+    if (!state.isRecording) return false;
+
+    var startInfo = midiNoteStartBeats[pitch];
+    if (!startInfo) return false;
+
+    var pattern = getCurrentPattern();
+    if (!pattern || pattern.type !== 'piano') {
+        delete midiNoteStartBeats[pitch];
+        return false;
+    }
+
+    var quantizeBeats = pianoRoll.quantize || 0.25;
+    var duration;
+
+    if (state.isPlaying) {
+        var clip = getSelectedClip();
+        var currentRelativeBeat = getPlaybackBeatNow() - (clip ? clip.startBeat : 0);
+        var endBeat = Math.round(currentRelativeBeat / quantizeBeats) * quantizeBeats;
+        duration = Math.max(quantizeBeats, endBeat - startInfo.beat);
+    } else {
+        var elapsedMs = performance.now() - startInfo.startTime;
+        var elapsedBeats = (elapsedMs / 1000) * (state.bpm / 60);
+        duration = Math.max(quantizeBeats, Math.round(elapsedBeats / quantizeBeats) * quantizeBeats);
+    }
+
+    var noteEndBeat = startInfo.beat + duration;
+    var clip = getSelectedClip();
+    var baseBeats = getClipLoopLength(clip, pattern) || (pattern.beats || 0);
+    if (noteEndBeat > baseBeats) {
+        var newBeats = Math.ceil(noteEndBeat / 4) * 4;
+        if (clip && (clip.loopCount === undefined || clip.loopCount <= 1.0001)) {
+            if ((pattern.beats || 0) < newBeats - 0.0001) {
+                applyPatternLengthWithBuffer(pattern, clip, newBeats);
+            } else {
+                clip.loopLength = newBeats;
+                clip.loopCount = 1;
+            }
+        } else if ((pattern.beats || 0) < newBeats - 0.0001) {
+            applyPatternLengthWithBuffer(pattern, clip, newBeats);
+        }
+        consoleLog('Extended pattern to ' + newBeats + ' beats');
+        renderTimeline();
+    }
+
+    pushUndo('piano-edit', captureStateForUndo('piano-edit'));
+    if (!pattern.notes) pattern.notes = [];
+    pattern.notes.push({
+        type: 'note',
+        pitch: pitch,
+        startBeat: startInfo.beat,
+        duration: duration,
+        velocity: (startInfo.velocity || 100) / 127
+    });
+
+    markPatternNoteVizDirtyForPattern(pattern);
+    scheduleRenderPianoRoll();
+    consoleLog('Recorded note ' + midiToNoteName(pitch) + ' at beat ' + startInfo.beat.toFixed(2));
+
+    delete midiNoteStartBeats[pitch];
+    return true;
+}
 
 function initMIDI() {
     if (!navigator.requestMIDIAccess) {
@@ -7698,34 +11807,8 @@ function handleMIDINoteOn(note, velocity, channel) {
 
         // Check if current pattern is a piano roll
         if (pattern && pattern.type === 'piano') {
-            // Record to piano roll - track start time
-            var quantizeBeats = 0.25;  // 1/16 note
-            var startBeat;
-
-            if (state.isPlaying) {
-                // Use current playback position
-                startBeat = Math.round(state.currentBeat / quantizeBeats) * quantizeBeats;
-                // Get position relative to the clip
-                var clip = getSelectedClip();
-                if (clip) {
-                    startBeat = startBeat - clip.startBeat;
-                }
-            } else {
-                // Not playing - use end of existing notes or start of pattern
-                if (pattern.notes.length > 0) {
-                    startBeat = Math.max.apply(null, pattern.notes.map(function(n) { return n.startBeat + n.duration; }));
-                } else {
-                    startBeat = 0;
-                }
-                startBeat = Math.round(startBeat / quantizeBeats) * quantizeBeats;
-            }
-
-            midiNoteStartBeats[note] = {
-                beat: startBeat,
-                velocity: velocity,
-                startTime: performance.now()
-            };
-        } else if (pattern && pattern.data) {
+            startPianoRollRecordNote(note, velocity);
+        } else if (pattern && pattern.type !== 'piano') {
             // Record to tracker pattern
             var noteName = midiToNoteName(note);
             var ampHex = Math.round(velocity / 127 * 255).toString(16).toUpperCase().padStart(2, '0');
@@ -7733,21 +11816,14 @@ function handleMIDINoteOn(note, velocity, channel) {
             var step = state.focusedStep;
 
             if (step < pattern.steps) {
-                var stepData = pattern.data[step];
-                if (stepData && stepData.columns) {
-                    while (stepData.columns.length <= noteCol) {
-                        stepData.columns.push({ note: '', amp: '', fx: [] });
-                    }
-                    var colData = stepData.columns[noteCol];
-                    colData.note = noteName;
-                    colData.amp = ampHex;
+                setCellValue(step, noteCol, 0, 'note', noteName);
+                setCellValue(step, noteCol, 0, 'amp', ampHex);
 
-                    invalidatePatternCache(getCurrentPatternIndex());
-                    renderTrackerGrid(true);
+                invalidatePatternCache(getCurrentPatternIndex());
+                renderTrackerGrid(true);
 
-                    if (state.editStep > 0) {
-                        state.focusedStep = Math.min(state.focusedStep + state.editStep, pattern.steps - 1);
-                    }
+                if (state.editStep > 0) {
+                    state.focusedStep = Math.min(state.focusedStep + state.editStep, pattern.steps - 1);
                 }
             }
         }
@@ -7763,61 +11839,8 @@ function handleMIDINoteOff(note, channel) {
     stopMidiNote(note);
 
     // Complete piano roll recording if we have a start beat tracked
-    if (midiNoteStartBeats[note] && state.isRecording) {
-        var startInfo = midiNoteStartBeats[note];
-        var pattern = getCurrentPattern();
-
-        if (pattern && pattern.type === 'piano') {
-            var quantizeBeats = 0.25;  // 1/16 note
-            var duration;
-
-            if (state.isPlaying) {
-                // Calculate duration from playback position
-                var clip = getSelectedClip();
-                var currentRelativeBeat = clip ? state.currentBeat - clip.startBeat : state.currentBeat;
-                var endBeat = Math.round(currentRelativeBeat / quantizeBeats) * quantizeBeats;
-                duration = Math.max(quantizeBeats, endBeat - startInfo.beat);
-            } else {
-                // Calculate duration from elapsed time
-                var elapsedMs = performance.now() - startInfo.startTime;
-                var elapsedBeats = (elapsedMs / 1000) * (state.bpm / 60);
-                duration = Math.max(quantizeBeats, Math.round(elapsedBeats / quantizeBeats) * quantizeBeats);
-            }
-
-            var noteEndBeat = startInfo.beat + duration;
-
-            // Auto-extend pattern if note goes beyond pattern length
-            if (noteEndBeat > pattern.beats) {
-                var newBeats = Math.ceil(noteEndBeat / 4) * 4;  // Round up to nearest 4 beats
-                pattern.beats = newBeats;
-                consoleLog('Extended pattern to ' + newBeats + ' beats');
-
-                // Update clip duration if needed
-                var clip = getSelectedClip();
-                if (clip) {
-                    var patternBeats = pattern.beats;
-                    var newLoopCount = Math.ceil(noteEndBeat / patternBeats);
-                    if (newLoopCount > clip.loopCount) {
-                        clip.loopCount = newLoopCount;
-                    }
-                    renderTimeline();
-                }
-            }
-
-            // Add note to pattern
-            if (!pattern.notes) pattern.notes = [];
-            pattern.notes.push({
-                pitch: note,
-                startBeat: startInfo.beat,
-                duration: duration,
-                velocity: startInfo.velocity / 127
-            });
-
-            renderPianoRoll();
-            consoleLog('Recorded note ' + midiToNoteName(note) + ' at beat ' + startInfo.beat.toFixed(2));
-        }
-
-        delete midiNoteStartBeats[note];
+    if (state.isRecording) {
+        finishPianoRollRecordNote(note);
     }
 
     // Visual feedback
@@ -7834,23 +11857,11 @@ function handleMIDICC(cc, value, channel) {
         var noteCol = state.focusedNoteCol || 0;
 
         if (pattern && step < pattern.steps) {
-            var stepData = pattern.data[step];
-            if (stepData && stepData.columns) {
-                // Ensure note column exists
-                while (stepData.columns.length <= noteCol) {
-                    stepData.columns.push({ note: '', amp: '', fx: [] });
-                }
-                var colData = stepData.columns[noteCol];
-                var fxIdx = mapping.fxColumn || 0;
-                if (!colData.fx) colData.fx = [];
-                while (colData.fx.length <= fxIdx) {
-                    colData.fx.push('');
-                }
-                colData.fx[fxIdx] = value.toString(16).toUpperCase().padStart(4, '0');
-
-                invalidatePatternCache(getCurrentPatternIndex());
-                renderTrackerGrid(true);
-            }
+            var fxIdx = mapping.fxColumn || 0;
+            var hexVal = value.toString(16).toUpperCase().padStart(4, '0');
+            setCellValue(step, noteCol, fxIdx, 'fx', hexVal);
+            invalidatePatternCache(getCurrentPatternIndex());
+            renderTrackerGrid(true);
         }
     }
 }
@@ -7948,7 +11959,7 @@ function initSampleEditor() {
         if (e.key === 'Delete' && !e.ctrlKey && !e.altKey && !e.shiftKey) {
             if (sampleEditor.currentSample) {
                 e.preventDefault();
-                deleteSelection();
+                deleteSampleSelection();
                 return;
             }
         }
@@ -7965,19 +11976,30 @@ function initSampleEditor() {
 }
 
 function switchEditorView(view) {
-    // Handle main view tabs (pattern vs sample)
+    // Handle main view tabs (song/sample)
     var tabs = document.querySelectorAll('.editor-view-tab');
     tabs.forEach(function(t) {
         var tabView = t.getAttribute('data-view');
         t.classList.toggle('active', tabView === view);
     });
 
-    // Main views: pattern-editor-area vs sample-editor-view
+    // Main views: song-editor-view vs sample-editor-view (pattern editor hidden in sample view)
     var sampleView = document.getElementById('sample-editor-view');
+    var songEditorView = document.getElementById('song-editor-view');
+    var songInfoView = document.getElementById('song-info-view');
     var patternEditorArea = document.getElementById('pattern-editor-area');
+    var editorSplitter = document.getElementById('editor-splitter');
 
     if (sampleView) sampleView.classList.toggle('hidden', view !== 'sample');
+    if (songEditorView) songEditorView.classList.toggle('hidden', view !== 'song');
+    if (songInfoView) songInfoView.classList.toggle('hidden', view !== 'info');
     if (patternEditorArea) patternEditorArea.classList.toggle('hidden', view === 'sample');
+    if (editorSplitter) editorSplitter.classList.toggle('hidden', view === 'sample');
+
+    if (view === 'song' || view === 'info') {
+        clampPatternEditorToView();
+        updatePatternToggleButton();
+    }
 
     // Resize and render waveform when switching to sample view
     if (view === 'sample' && sampleEditor.audioBuffer) {
@@ -7986,6 +12008,17 @@ function switchEditorView(view) {
             renderWaveform();
         }, 50);
     }
+}
+
+function initSongInfo() {
+    var infoEl = document.getElementById('song-info-text');
+    if (!infoEl) return;
+
+    infoEl.value = state.songInfo || '';
+
+    infoEl.addEventListener('input', function() {
+        state.songInfo = this.value;
+    });
 }
 
 async function loadSampleIntoEditor(sample) {
@@ -8093,10 +12126,14 @@ function resizeCanvas() {
     if (!sampleEditor.canvas) return;
 
     var container = sampleEditor.canvas.parentElement;
-    var rect = container.getBoundingClientRect();
+    var canvasStyles = window.getComputedStyle(sampleEditor.canvas);
+    var padX = parseFloat(canvasStyles.paddingLeft || 0) + parseFloat(canvasStyles.paddingRight || 0);
+    var padY = parseFloat(canvasStyles.paddingTop || 0) + parseFloat(canvasStyles.paddingBottom || 0);
+    var width = Math.max(1, container.clientWidth - padX);
+    var height = Math.max(1, container.clientHeight - padY);
 
-    sampleEditor.canvas.width = rect.width;
-    sampleEditor.canvas.height = rect.height;
+    sampleEditor.canvas.width = width;
+    sampleEditor.canvas.height = height;
 }
 
 function computeWaveformData() {
@@ -8367,7 +12404,8 @@ function handleWaveformMouseDown(e) {
     if (!sampleEditor.audioBuffer) return;
 
     var rect = sampleEditor.canvas.getBoundingClientRect();
-    var x = e.clientX - rect.left;
+    var scale = getUiScale();
+    var x = (e.clientX - rect.left) / scale;
     var samplePos = pixelToSample(x);
 
     // Check if clicking on a slice marker
@@ -8400,7 +12438,8 @@ function handleWaveformMouseMove(e) {
     if (!sampleEditor.audioBuffer) return;
 
     var rect = sampleEditor.canvas.getBoundingClientRect();
-    var x = e.clientX - rect.left;
+    var scale = getUiScale();
+    var x = (e.clientX - rect.left) / scale;
     var samplePos = pixelToSample(x);
 
     if (sampleEditor.isDragging && sampleEditor.dragSliceIndex >= 0) {
@@ -8444,7 +12483,8 @@ function handleWaveformWheel(e) {
 
     // Get mouse position for zoom centering
     var rect = sampleEditor.canvas.getBoundingClientRect();
-    var mouseX = e.clientX - rect.left;
+    var scale = getUiScale();
+    var mouseX = (e.clientX - rect.left) / scale;
     var mouseSample = pixelToSample(mouseX);
 
     // Scroll up = zoom in, Scroll down = zoom out
@@ -8542,7 +12582,7 @@ function sampleEditorUndo() {
 }
 
 // Delete selected portion of the waveform (or entire sample if no selection)
-async function deleteSelection() {
+async function deleteSampleSelection() {
     if (!sampleEditor.audioBuffer) {
         consoleLog('No sample loaded');
         return;
@@ -9623,12 +13663,197 @@ function cacheDOMReferences() {
     domCache.console = document.getElementById('console');
 }
 
+function updateUiScale() {
+    var scale = 2 / 3;
+    document.documentElement.style.setProperty('--ui-scale', scale.toFixed(3));
+    clampPatternEditorToView();
+}
+
+function getUiScale() {
+    var scale = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--ui-scale'));
+    if (!isFinite(scale) || scale <= 0) return 1;
+    return scale;
+}
+
+function getScaledClientX(e) {
+    return e.clientX / getUiScale();
+}
+
+function getScaledClientY(e) {
+    return e.clientY / getUiScale();
+}
+
+function getScaledOffsetInElement(e, el) {
+    var rect = el.getBoundingClientRect();
+    var scale = getUiScale();
+    return {
+        x: (e.clientX - rect.left) / scale,
+        y: (e.clientY - rect.top) / scale
+    };
+}
+
+function positionMenuAtClient(menu, clientX, clientY) {
+    if (!menu) return;
+    var scale = getUiScale();
+    var x = clientX / scale;
+    var y = clientY / scale;
+
+    menu.style.left = x + 'px';
+    menu.style.top = y + 'px';
+
+    var rect = menu.getBoundingClientRect();
+    if (rect.right > window.innerWidth) {
+        var overflowX = rect.right - window.innerWidth;
+        menu.style.left = (x - overflowX / scale) + 'px';
+    }
+    if (rect.bottom > window.innerHeight) {
+        var overflowY = rect.bottom - window.innerHeight;
+        menu.style.top = (y - overflowY / scale) + 'px';
+    }
+}
+
+// ============================================
+// PATTERN EDITOR RESIZE / COLLAPSE
+// ============================================
+
+var patternResizeState = {
+    active: false,
+    startY: 0,
+    startPatternHeight: 0,
+    lastPatternHeight: null,
+    minPatternHeight: 120,
+    minSongHeight: 160,
+    splitterHeight: 6
+};
+
+function clampPatternHeight(height) {
+    var center = document.querySelector('.center-panel');
+    var splitter = document.getElementById('editor-splitter');
+    if (!center) return height;
+    var totalHeight = center.clientHeight;
+    var tabs = document.querySelector('.editor-view-tabs');
+    var reserved = tabs ? tabs.offsetHeight : 0;
+    var availableHeight = Math.max(0, totalHeight - reserved);
+    var splitterHeight = splitter ? splitter.offsetHeight : patternResizeState.splitterHeight;
+    var maxPattern = Math.max(patternResizeState.minPatternHeight, availableHeight - splitterHeight - patternResizeState.minSongHeight);
+    return Math.max(patternResizeState.minPatternHeight, Math.min(maxPattern, height));
+}
+
+function setPatternCollapsed(collapsed) {
+    var patternArea = document.getElementById('pattern-editor-area');
+    var splitter = document.getElementById('editor-splitter');
+    if (!patternArea || !splitter) return;
+
+    if (collapsed) {
+        if (!patternArea.classList.contains('collapsed')) {
+            patternResizeState.lastPatternHeight = patternArea.offsetHeight || patternResizeState.lastPatternHeight || 280;
+        }
+        patternArea.classList.add('collapsed');
+        patternArea.style.height = '0px';
+    } else {
+        patternArea.classList.remove('collapsed');
+        var restoreHeight = patternResizeState.lastPatternHeight || 280;
+        var clamped = clampPatternHeight(restoreHeight);
+        patternArea.style.height = clamped + 'px';
+        patternResizeState.lastPatternHeight = clamped;
+    }
+    updatePatternToggleButton();
+}
+
+function togglePatternCollapse() {
+    var patternArea = document.getElementById('pattern-editor-area');
+    if (!patternArea || patternArea.classList.contains('hidden')) return;
+    var collapsed = patternArea.classList.contains('collapsed');
+    setPatternCollapsed(!collapsed);
+}
+
+function updatePatternToggleButton() {
+    var button = document.getElementById('pattern-toggle-btn');
+    var patternArea = document.getElementById('pattern-editor-area');
+    if (!button || !patternArea) return;
+    var collapsed = patternArea.classList.contains('collapsed');
+    button.textContent = collapsed ? 'Show Pattern' : 'Hide Pattern';
+}
+
+function clampPatternEditorToView() {
+    var patternArea = document.getElementById('pattern-editor-area');
+    if (!patternArea || patternArea.classList.contains('hidden') || patternArea.classList.contains('collapsed')) return;
+    var currentHeight = patternArea.offsetHeight || 0;
+    var clamped = clampPatternHeight(currentHeight);
+    if (Math.abs(clamped - currentHeight) > 0.5) {
+        patternArea.style.height = clamped + 'px';
+        patternResizeState.lastPatternHeight = clamped;
+    }
+}
+
+function initPatternResizer() {
+    var splitter = document.getElementById('editor-splitter');
+    var patternArea = document.getElementById('pattern-editor-area');
+    var toggleBtn = document.getElementById('pattern-toggle-btn');
+    if (!splitter || !patternArea) return;
+
+    patternResizeState.lastPatternHeight = patternArea.offsetHeight || patternResizeState.lastPatternHeight;
+    updatePatternToggleButton();
+
+    splitter.addEventListener('mousedown', function(e) {
+        if (e.button !== 0) return;
+        if (patternArea.classList.contains('hidden')) return;
+        e.preventDefault();
+
+        setPatternCollapsed(false);
+
+        patternResizeState.active = true;
+        patternResizeState.startY = getScaledClientY(e);
+        patternResizeState.startPatternHeight = patternArea.offsetHeight;
+        patternResizeState.splitterHeight = splitter.offsetHeight || patternResizeState.splitterHeight;
+
+        document.body.style.cursor = 'row-resize';
+        document.addEventListener('mousemove', onPatternResizeMove);
+        document.addEventListener('mouseup', onPatternResizeUp);
+    });
+
+    splitter.addEventListener('dblclick', function(e) {
+        e.preventDefault();
+        togglePatternCollapse();
+    });
+
+    if (toggleBtn) {
+        toggleBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            togglePatternCollapse();
+        });
+    }
+}
+
+function onPatternResizeMove(e) {
+    if (!patternResizeState.active) return;
+    var patternArea = document.getElementById('pattern-editor-area');
+    if (!patternArea) return;
+
+    var deltaY = getScaledClientY(e) - patternResizeState.startY;
+    var newHeight = patternResizeState.startPatternHeight - deltaY;
+    newHeight = clampPatternHeight(newHeight);
+
+    patternArea.style.height = newHeight + 'px';
+    patternResizeState.lastPatternHeight = newHeight;
+}
+
+function onPatternResizeUp() {
+    if (!patternResizeState.active) return;
+    patternResizeState.active = false;
+    document.body.style.cursor = '';
+    document.removeEventListener('mousemove', onPatternResizeMove);
+    document.removeEventListener('mouseup', onPatternResizeUp);
+}
+
 // ============================================
 // INITIALIZATION
 // ============================================
 
 function init() {
     cacheDOMReferences();
+    updateUiScale();
+    window.addEventListener('resize', updateUiScale);
 
     consoleLog('Initializing Csound Mod Tracker...');
 
@@ -9643,6 +13868,9 @@ function init() {
     initInstrumentTabs();
     initSampleLoader();
     initSampleEditor();
+    initSongInfo();
+    initPatternResizer();
+    attachCodeEditorShortcuts();
     initPianoRoll();
     initMIDI();
     initContextMenu();
@@ -9767,14 +13995,12 @@ function init() {
         var rulerEl = document.getElementById('timeline-ruler');
         if (rulerEl) {
             rulerEl.addEventListener('click', function(e) {
-                var header = rulerEl.closest('.timeline-header');
-                var scrollLeft = header ? header.scrollLeft : 0;
-                var rect = rulerEl.getBoundingClientRect();
-                var clickX = e.clientX - rect.left + scrollLeft;
-                var beat = clickX / timelinePixelsPerBeat;
-                var snapBeats = state.timeline.gridSnap || 1;
-                beat = Math.max(0, Math.round(beat / snapBeats) * snapBeats);
+                var timelineContainer = document.getElementById('timeline-tracks');
+                if (!timelineContainer) return;
+                var beat = getTimelineBeatFromClientX(e.clientX, timelineContainer);
                 state.currentBeat = beat;
+                var cursorTrack = state.selectedTrack >= 0 ? state.selectedTrack : 0;
+                updateTimelineCursor(beat, cursorTrack);
                 var playhead = document.getElementById('timeline-playhead');
                 if (playhead) {
                     playhead.style.display = 'block';
@@ -9837,13 +14063,13 @@ function init() {
             if (e.button === 1) { // Middle mouse button
                 e.preventDefault();
                 middleMouseZoom.active = true;
-                middleMouseZoom.startX = e.clientX;
+                middleMouseZoom.startX = getScaledClientX(e);
                 middleMouseZoom.startZoom = timelinePixelsPerBeat;
             }
         });
         document.addEventListener('mousemove', function(e) {
             if (middleMouseZoom.active) {
-                var delta = e.clientX - middleMouseZoom.startX;
+                var delta = getScaledClientX(e) - middleMouseZoom.startX;
                 var zoomFactor = 1 + (delta / 200);
                 // Allow zooming from 5 (zoomed out) to 500 (zoomed in to see 128th/256th notes)
                 timelinePixelsPerBeat = Math.max(5, Math.min(500, middleMouseZoom.startZoom * zoomFactor));
@@ -9875,10 +14101,36 @@ function init() {
         });
     }
 
+    // Piano roll context menu
+    var pianoContextMenu = document.getElementById('piano-roll-context-menu');
+    if (pianoContextMenu) {
+        pianoContextMenu.addEventListener('click', function(e) {
+            var item = e.target.closest('.context-menu-item');
+            if (!item) return;
+            var action = item.getAttribute('data-action');
+            if (!action) return;
+            if (item.classList.contains('has-submenu')) {
+                item.classList.toggle('open');
+                return;
+            }
+            if (action === 'quantize') {
+                var grid = parseFloat(item.getAttribute('data-grid'));
+                if (!isNaN(grid)) {
+                    handlePianoRollContextAction(action, grid);
+                }
+                return;
+            }
+            handlePianoRollContextAction(action);
+        });
+    }
+
     // Hide context menus on click elsewhere
     document.addEventListener('click', function(e) {
         if (!e.target.closest('#timeline-context-menu')) {
             hideTimelineContextMenu();
+        }
+        if (!e.target.closest('#piano-roll-context-menu')) {
+            hidePianoRollContextMenu();
         }
         if (!e.target.closest('#code-editor-context-menu')) {
             hideCodeEditorContextMenu();
@@ -9886,11 +14138,105 @@ function init() {
     });
 
     document.getElementById('btn-compile').addEventListener('click', compileInstruments);
-    document.getElementById('btn-save').addEventListener('click', saveSong);
-    document.getElementById('btn-load').addEventListener('click', function() {
-        document.getElementById('file-input').click();
+
+    // ============================================
+    // DROPDOWN MENUS
+    // ============================================
+    // Toggle dropdowns on click
+    document.querySelectorAll('.dropdown-toggle').forEach(function(toggle) {
+        toggle.addEventListener('click', function(e) {
+            e.stopPropagation();
+            var dropdown = this.parentElement;
+            var wasOpen = dropdown.classList.contains('open');
+
+            // Close all dropdowns
+            document.querySelectorAll('.dropdown').forEach(function(d) {
+                d.classList.remove('open');
+            });
+
+            // Toggle this one
+            if (!wasOpen) {
+                dropdown.classList.add('open');
+            }
+        });
     });
-    document.getElementById('btn-export-csd').addEventListener('click', exportCSD);
+
+    // Close dropdowns when clicking outside
+    document.addEventListener('click', function(e) {
+        if (!e.target.closest('.dropdown')) {
+            document.querySelectorAll('.dropdown').forEach(function(d) {
+                d.classList.remove('open');
+            });
+        }
+    });
+
+    // File menu items
+    var menuNew = document.getElementById('menu-new');
+    if (menuNew) {
+        menuNew.addEventListener('click', function() {
+            if (confirm('Create a new song? Unsaved changes will be lost.')) {
+                location.reload();
+            }
+        });
+    }
+
+    var menuSave = document.getElementById('menu-save');
+    if (menuSave) {
+        menuSave.addEventListener('click', saveSong);
+    }
+
+    var menuSaveAs = document.getElementById('menu-save-as');
+    if (menuSaveAs) {
+        menuSaveAs.addEventListener('click', function() {
+            var name = prompt('Enter song name:', 'mysong');
+            if (name) {
+                saveSongAs(name);
+            }
+        });
+    }
+
+    var menuLoad = document.getElementById('menu-load');
+    if (menuLoad) {
+        menuLoad.addEventListener('click', function() {
+            document.getElementById('file-input').click();
+        });
+    }
+
+    var menuExportCsd = document.getElementById('menu-export-csd');
+    if (menuExportCsd) {
+        menuExportCsd.addEventListener('click', exportCSD);
+    }
+
+    // Edit menu items
+    var menuUndo = document.getElementById('menu-undo');
+    if (menuUndo) {
+        menuUndo.addEventListener('click', undo);
+    }
+
+    var menuRedo = document.getElementById('menu-redo');
+    if (menuRedo) {
+        menuRedo.addEventListener('click', redo);
+    }
+
+    var menuCut = document.getElementById('menu-cut');
+    if (menuCut) {
+        menuCut.addEventListener('click', cutSelection);
+    }
+
+    var menuCopy = document.getElementById('menu-copy');
+    if (menuCopy) {
+        menuCopy.addEventListener('click', copySelection);
+    }
+
+    var menuPaste = document.getElementById('menu-paste');
+    if (menuPaste) {
+        menuPaste.addEventListener('click', pasteSelection);
+    }
+
+    var menuSelectAll = document.getElementById('menu-select-all');
+    if (menuSelectAll) {
+        menuSelectAll.addEventListener('click', selectAll);
+    }
 
     // Demo buttons - load 1.cst, 2.cst, 3.cst, 4.cst
     var demoBtns = document.querySelectorAll('.demo-btn');
@@ -9898,6 +14244,10 @@ function init() {
         btn.addEventListener('click', function() {
             var demoNum = this.getAttribute('data-demo');
             loadDemo(demoNum);
+            // Close dropdown
+            document.querySelectorAll('.dropdown').forEach(function(d) {
+                d.classList.remove('open');
+            });
         });
     });
 
@@ -9907,6 +14257,17 @@ function init() {
         consoleEl.style.display = isHidden ? 'block' : 'none';
         this.textContent = isHidden ? 'Hide' : 'Show';
     });
+
+    // Mobile: Toggle code editor panel
+    var btnToggleEditor = document.getElementById('btn-toggle-editor');
+    if (btnToggleEditor) {
+        btnToggleEditor.addEventListener('click', function() {
+            var editorContainer = document.getElementById('editor-container');
+            if (editorContainer) {
+                editorContainer.classList.toggle('collapsed');
+            }
+        });
+    }
 
     document.getElementById('file-input').addEventListener('change', function(e) {
         if (e.target.files.length > 0) {
